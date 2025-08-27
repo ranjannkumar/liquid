@@ -24,6 +24,7 @@ const SUPABASE_URL             = Deno.env.get("SUPABASE_URL");
 const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
 const TELEGRAM_BOT_KEY         = Deno.env.get("TELEGRAM_BOT_KEY");
 const TELEGRAM_CHAT_ID         = Deno.env.get("TELEGRAM_CHAT_ID");
+const REFERRAL_TOKEN_AMOUNT    = Deno.env.get("REFERRAL_TOKEN_AMOUNT");
 
 if (!STRIPE_SECRET_KEY || !STRIPE_WEBHOOK_SECRET || !SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
   const errMsg = `[${EDGE_FUNCTION_NAME}] ❌ Missing required environment variables (STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET, SUPABASE_URL, or SUPABASE_SERVICE_ROLE_KEY).`;
@@ -484,6 +485,46 @@ serve(async (req: Request) => {
         });
 
         console.log(`[${EDGE_FUNCTION_NAME}] ✅ New subscription created for ${user_id}`);
+
+        // Referral Logic
+        try {
+          const { data: referralData, error: referralError } = await supabase
+            .from("referrals")
+            .select("id, referrer_user_id, is_rewarded")
+            .eq("referred_user_id", user_id)
+            .single();
+
+          if (referralError) {
+            console.warn(`[${EDGE_FUNCTION_NAME}] ⚠️ No referral found or error for referred user ${user_id}: ${referralError.message}`);
+          } else if (referralData && !referralData.is_rewarded) {
+            if (!REFERRAL_TOKEN_AMOUNT) {
+              console.warn(`[${EDGE_FUNCTION_NAME}] ⚠️ REFERRAL_TOKEN_AMOUNT not set, skipping referral reward.`);
+            } else {
+              const tokens = parseInt(REFERRAL_TOKEN_AMOUNT);
+              if (!isNaN(tokens) && tokens > 0) {
+                const expiresAt = new Date();
+                expiresAt.setDate(expiresAt.getDate() + 365); // Expire referral tokens after one year
+
+                await supabase.from("user_token_batches").insert({
+                  user_id: referralData.referrer_user_id,
+                  source: "referral",
+                  amount: tokens,
+                  consumed: 0,
+                  is_active: true,
+                  expires_at: expiresAt.toISOString(),
+                });
+
+                await supabase.from("referrals").update({ is_rewarded: true }).eq("id", referralData.id);
+
+                console.log(`[${EDGE_FUNCTION_NAME}] 🎁 Issued ${tokens} referral tokens to referrer ${referralData.referrer_user_id}`);
+              }
+            }
+          }
+        } catch (err: any) {
+          console.error(`[${EDGE_FUNCTION_NAME}] ❌ Error handling referral logic: ${err.message}`);
+          await notifyTelegram(`${EDGE_FUNCTION_NAME} / ❌ Error handling referral logic: ${err.message}`);
+        }
+
       } catch (err: any) {
         console.error(`[${EDGE_FUNCTION_NAME}] ❌ Error handling subscription checkout for ${user_id}: ${err.message}`);
         await notifyTelegram(`${EDGE_FUNCTION_NAME} / ❌ Error handling subscription checkout for ${user_id}: ${err.message}`);

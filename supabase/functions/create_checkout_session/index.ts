@@ -25,9 +25,10 @@ const SUPABASE_URL                = Deno.env.get("SUPABASE_URL");
 const SUPABASE_SERVICE_ROLE_KEY   = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
 const TELEGRAM_BOT_KEY            = Deno.env.get("TELEGRAM_BOT_KEY");
 const TELEGRAM_CHAT_ID            = Deno.env.get("TELEGRAM_CHAT_ID");
+const DOMAIN                      = Deno.env.get("DOMAIN"); // New variable
 
-if (!STRIPE_SECRET_KEY || !SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
-  const errMsg = `[${EDGE_FUNCTION_NAME}] ❌ Missing required environment variables (STRIPE_SECRET_KEY, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY).`;
+if (!STRIPE_SECRET_KEY || !SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY || !DOMAIN) {
+  const errMsg = `[${EDGE_FUNCTION_NAME}] ❌ Missing required environment variables (STRIPE_SECRET_KEY, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, or DOMAIN).`;
   console.error(errMsg);
   if (TELEGRAM_BOT_KEY && TELEGRAM_CHAT_ID) {
     await notifyTelegram(`${EDGE_FUNCTION_NAME} / ❌ Missing required environment variables.`);
@@ -37,6 +38,7 @@ if (!STRIPE_SECRET_KEY || !SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
 
 const allowedOrigins = new Set([
   "https://localhost",
+  DOMAIN, // Add the domain to the allowed origins
 ]);
 
 function getCorsHeaders(origin: string): HeadersInit {
@@ -48,7 +50,6 @@ function getCorsHeaders(origin: string): HeadersInit {
     "Access-Control-Max-Age": "3600"
   };
 }
-
 
 const stripe = new Stripe(STRIPE_SECRET_KEY, { apiVersion: "2023-10-16" });
 const supabase: SupabaseClient = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
@@ -92,7 +93,7 @@ export const config = {
 serve(async (req: Request) => {
   const origin = req.headers.get("origin") || "";
   const corsHeaders = getCorsHeaders(origin);
-  const baseUrl = allowedOrigins.has(origin) ? origin : "https://localhost";
+  const domain = Deno.env.get("DOMAIN")!;
 
   // 0. CORS preflight handler
   if (req.method === "OPTIONS") {
@@ -277,8 +278,8 @@ serve(async (req: Request) => {
         payment_method_types: ["card"],
         customer_email: email,
         line_items: [{ price: priceRow.price_id, quantity: 1 }],
-        success_url: `${baseUrl}/home`,
-        cancel_url: `${baseUrl}/cancel`,
+        success_url: `${domain}/success`,
+        cancel_url: `${domain}/cancel`,
         metadata: { user_id, plan_type, plan_option },
       };
       if (stripeMode === "subscription") {
