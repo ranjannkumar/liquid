@@ -13,6 +13,7 @@
 import { serve } from "https://deno.land/std/http/server.ts";
 import Stripe from "npm:stripe";
 import { createClient, SupabaseClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { decodeJwt } from "npm:jose"
 
 const EDGE_FUNCTION_NAME = "cancel_subscription";
 
@@ -22,9 +23,10 @@ const SUPABASE_URL                = Deno.env.get("SUPABASE_URL");
 const SUPABASE_SERVICE_ROLE_KEY   = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
 const TELEGRAM_BOT_KEY            = Deno.env.get("TELEGRAM_BOT_KEY");
 const TELEGRAM_CHAT_ID            = Deno.env.get("TELEGRAM_CHAT_ID");
+const DOMAIN                      = Deno.env.get("DOMAIN"); // New: Get from env
 
-if (!STRIPE_SECRET_KEY || !SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
-  const errMsg = `[${EDGE_FUNCTION_NAME}] ❌ Missing required environment variables (STRIPE_SECRET_KEY, SUPABASE_URL, or SUPABASE_SERVICE_ROLE_KEY).`;
+if (!STRIPE_SECRET_KEY || !SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY || !DOMAIN) {
+  const errMsg = `[${EDGE_FUNCTION_NAME}] ❌ Missing required environment variables (STRIPE_SECRET_KEY, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, or DOMAIN).`;
   console.error(errMsg);
   if (TELEGRAM_BOT_KEY && TELEGRAM_CHAT_ID) {
     await notifyTelegram(`${EDGE_FUNCTION_NAME} / ❌ Missing required environment variables.`);
@@ -35,9 +37,19 @@ if (!STRIPE_SECRET_KEY || !SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
 const stripe = new Stripe(STRIPE_SECRET_KEY, { apiVersion: "2025-07-30.basil" });
 const supabase: SupabaseClient = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
-const allowedOrigins = new Set([
-  "https://localhost",
-]);
+function getCorsHeaders(origin: string): HeadersInit {
+  const allowedOrigins = new Set([
+    "https://localhost",
+    DOMAIN, // Use the DOMAIN env variable
+  ]);
+  return {
+    "Access-Control-Allow-Origin": allowedOrigins.has(origin) ? origin : "",
+    "Access-Control-Allow-Methods": "POST, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization",
+    "Access-Control-Allow-Credentials": "true",
+    "Access-Control-Max-Age": "3600"
+  };
+}
 
 /**
  * Sends a notification message to Telegram.
@@ -77,17 +89,9 @@ export const config = {
 };
 
 serve(async (req: Request) => {
-
   const origin = req.headers.get("origin") || "";
-  const corsHeaders = {
-    "Access-Control-Allow-Origin": allowedOrigins.has(origin) ? origin : "",
-    "Access-Control-Allow-Methods": "POST, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type, Authorization",
-    "Access-Control-Allow-Credentials": "true",
-    "Access-Control-Max-Age": "3600"
-  };
+  const corsHeaders = getCorsHeaders(origin);
 
-  
   // 1. CORS preflight handler
   if (req.method === "OPTIONS") {
     console.log(`[${EDGE_FUNCTION_NAME}] 🔄 CORS preflight request received.`);
@@ -104,17 +108,17 @@ serve(async (req: Request) => {
     // 2. Authenticate via JWT
     const authHeader = req.headers.get("Authorization") || "";
     const token = authHeader.replace("Bearer ", "");
-    let payload: unknown; // Use 'unknown' instead of 'any'
+    let payload: unknown;
     try {
-      payload = JSON.parse(atob(token.split(".")[1]));
+        payload = decodeJwt(token);
     } catch (err: unknown) {
-      console.warn(`[${EDGE_FUNCTION_NAME}] ⚠️ Failed to decode JWT: ${err}`);
-      return new Response(JSON.stringify({ error: "Unauthorized" }), {
-        status: 401,
-        headers: corsHeaders,
-      });
+        console.warn(`[${EDGE_FUNCTION_NAME}] ⚠️ Failed to decode or verify JWT: ${err}`);
+        return new Response(JSON.stringify({ error: "Unauthorized" }), {
+            status: 401,
+            headers: corsHeaders,
+        });
     }
-    
+
     // Type guard to ensure payload has a 'sub' property
     if (typeof payload !== 'object' || payload === null || !('sub' in payload)) {
       console.warn(`[${EDGE_FUNCTION_NAME}] ⚠️ JWT missing sub claim or invalid payload.`);
@@ -156,7 +160,7 @@ serve(async (req: Request) => {
 
       const activeSubId = data.stripe_subscription_id;
       console.log(`[${EDGE_FUNCTION_NAME}] ✅ Found active subscription ID: ${activeSubId} for user: ${user_id}`);
-      
+
       // 4. Cancel at period end in Stripe
       await stripe.subscriptions.update(activeSubId, { cancel_at_period_end: true });
       console.log(`[${EDGE_FUNCTION_NAME}] 🎬 Scheduled cancellation for subscription ID: ${activeSubId}`);

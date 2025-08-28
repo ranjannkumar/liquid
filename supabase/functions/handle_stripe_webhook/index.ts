@@ -4,11 +4,12 @@
  * Processes Stripe webhook events:
  * 1. Verifies webhook signature and parses event.
  * 2. Handles `invoice.payment_failed` → marks user payment issue.
- * 3. Handles `customer.subscription.deleted` → deactivates subscription and flags payment issue.
+ * 3. Handles `customer.subscription.deleted` → deactivates subscription.
  * 4. Handles `invoice.paid` & `customer.subscription.updated` → creates or updates subscription, refilling tokens.
- * 5. Handles `checkout.session.completed` → finalizes one-time token purchases or new subscriptions.
- * 6. Logs all major steps with the function name prefix.
- * 7. Sends critical failure notifications to Telegram.
+ * 5. Handles `customer.subscription.created` → creates a new subscription entry in the database.
+ * 6. Handles `checkout.session.completed` → finalizes one-time token purchases or new subscriptions.
+ * 7. Logs all major steps with the function name prefix.
+ * 8. Sends critical failure notifications to Telegram.
  */
 
 import { serve } from "https://deno.land/std/http/server.ts";
@@ -274,6 +275,27 @@ async function createOrUpdateSubscription(params: {
   }
 }
 
+async function createOrUpdateSubscriptionFromStripe(stripeSub: Stripe.Subscription) {
+    const user_id = stripeSub.metadata?.user_id as string;
+    if (!user_id) {
+      console.warn(`[${EDGE_FUNCTION_NAME}] ⚠️ Missing user_id in subscription metadata for created event`);
+      return;
+    }
+
+    const plan = stripeSub.items.data[0].price.nickname ?? "basic";
+    const billing_cycle = stripeSub.items.data[0].price.recurring?.interval ?? "monthly";
+
+    await createOrUpdateSubscription({
+      user_id,
+      plan,
+      billing_cycle,
+      stripe_subscription_id: stripeSub.id,
+    });
+
+    console.log(`[${EDGE_FUNCTION_NAME}] ✅ New subscription created from Stripe event for ${user_id}`);
+}
+
+
 export const config = {
   runtime: "edge",
   permissions: "public",
@@ -341,7 +363,7 @@ serve(async (req: Request) => {
       await supabase.from("subscriptions").update({ is_active: false }).eq("user_id", user_id);
       await supabase
         .from("users")
-        .update({ has_active_subscription: false, has_payment_issue: true })
+        .update({ has_active_subscription: false }) // Removed `has_payment_issue: true`
         .eq("user_id", user_id);
       console.log(`[${EDGE_FUNCTION_NAME}] 🔕 Subscription cancelled for ${user_id}`);
     } catch (err: unknown) {
@@ -353,6 +375,13 @@ serve(async (req: Request) => {
     }
 
     return new Response("Subscription cancelled", { status: 200 });
+  }
+  
+  // New handler for customer.subscription.created
+  if (event.type === "customer.subscription.created") {
+    const subscription = event.data.object as Stripe.Subscription;
+    await createOrUpdateSubscriptionFromStripe(subscription);
+    return new Response("Subscription created", { status: 200 });
   }
 
   // 4. Handle invoice.paid & customer.subscription.updated
