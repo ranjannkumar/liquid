@@ -51,7 +51,7 @@ function getCorsHeaders(origin: string): HeadersInit {
   };
 }
 
-const stripe = new Stripe(STRIPE_SECRET_KEY, { apiVersion: "2023-10-16" });
+const stripe = new Stripe(STRIPE_SECRET_KEY, { apiVersion: "2025-07-30.basil" });
 const supabase: SupabaseClient = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
 /**
@@ -81,8 +81,9 @@ async function notifyTelegram(message: string) {
     } else {
       console.log(`[${EDGE_FUNCTION_NAME}] 📢 Telegram notification sent.`);
     }
-  } catch (err) {
-    console.error(`[${EDGE_FUNCTION_NAME}] ❌ Failed to send Telegram message: ${err}`);
+  } catch (err: unknown) {
+    const errorMessage = err instanceof Error ? err.message : String(err);
+    console.error(`[${EDGE_FUNCTION_NAME}] ❌ Failed to send Telegram message: ${errorMessage}`);
   }
 }
 
@@ -93,12 +94,15 @@ export const config = {
 serve(async (req: Request) => {
   const origin = req.headers.get("origin") || "";
   const corsHeaders = getCorsHeaders(origin);
-  const domain = Deno.env.get("DOMAIN")!;
 
-  // 0. CORS preflight handler
+   // 0. CORS preflight handler
   if (req.method === "OPTIONS") {
     return new Response(null, { status: 204, headers: corsHeaders });
   }
+  
+  const domain = Deno.env.get("DOMAIN")!;
+
+ 
 
   if (req.method !== "POST") {
     return new Response("Method Not Allowed", { status: 405, headers: corsHeaders });
@@ -108,19 +112,29 @@ serve(async (req: Request) => {
     // 1. Authenticate via JWT
     const authHeader = req.headers.get("Authorization") || "";
     const token = authHeader.replace("Bearer ", "");
-    let payload: any;
+    let payload: unknown;
     try {
       payload = JSON.parse(atob(token.split(".")[1]));
-    } catch (err) {
-      console.warn(`[${EDGE_FUNCTION_NAME}] ⚠️ Failed to decode JWT: ${err}`);
+    } catch (err: unknown) {
+      const errorMessage = err instanceof Error ? err.message : String(err);
+      console.warn(`[${EDGE_FUNCTION_NAME}] ⚠️ Failed to decode JWT: ${errorMessage}`);
       return new Response("Unauthorized", {
         status: 401,
         headers: { "Access-Control-Allow-Origin": "*" },
       });
     }
 
-    const user_id = payload.sub;
-    const email = payload.email;
+    if (typeof payload !== 'object' || payload === null || !('sub' in payload) || !('email' in payload)) {
+      console.warn(`[${EDGE_FUNCTION_NAME}] ⚠️ JWT missing sub or email.`);
+      return new Response("Unauthorized", {
+        status: 401,
+        headers: { "Access-Control-Allow-Origin": "*" },
+      });
+    }
+    
+    const user_id = (payload as { sub: string, email: string }).sub;
+    const email = (payload as { sub: string, email: string }).email;
+    
     if (!user_id || !email) {
       console.warn(`[${EDGE_FUNCTION_NAME}] ⚠️ JWT missing sub or email.`);
       return new Response("Unauthorized", {
@@ -150,9 +164,12 @@ serve(async (req: Request) => {
         });
       }
       console.log(`[${EDGE_FUNCTION_NAME}] ✅ User exists in database.`);
-    } catch (err: any) {
-      console.error(`[${EDGE_FUNCTION_NAME}] ❌ Error verifying user existence: ${err.message}`);
-      await notifyTelegram(`${EDGE_FUNCTION_NAME} / ❌ Error verifying user: ${err.message}`);
+    } catch (err: unknown) {
+      const errorMessage = err instanceof Error ? err.message : String(err);
+      console.error(`[${EDGE_FUNCTION_NAME}] ❌ Error verifying user existence: ${errorMessage}`);
+      if (err instanceof Error) {
+        await notifyTelegram(`${EDGE_FUNCTION_NAME} / ❌ Error verifying user: ${errorMessage}`);
+      }
       return new Response("Internal server error", {
         status: 500,
         headers: { "Access-Control-Allow-Origin": "*" },
@@ -160,24 +177,28 @@ serve(async (req: Request) => {
     }
 
     // 3. Parse and validate request body
-    let body: any;
+    let body: unknown;
     try {
       body = await req.json();
-    } catch (err) {
-      console.warn(`[${EDGE_FUNCTION_NAME}] ⚠️ Failed to parse JSON body: ${err}`);
+    } catch (err: unknown) {
+      const errorMessage = err instanceof Error ? err.message : String(err);
+      console.warn(`[${EDGE_FUNCTION_NAME}] ⚠️ Failed to parse JSON body: ${errorMessage}`);
       return new Response("Invalid JSON payload", {
         status: 400,
         headers: { "Access-Control-Allow-Origin": "*" },
       });
     }
-    const { plan_type, plan_option } = body;
-    if (!plan_type || !plan_option) {
+
+    if (typeof body !== 'object' || body === null || !('plan_type' in body) || !('plan_option' in body)) {
       console.warn(`[${EDGE_FUNCTION_NAME}] ⚠️ Missing plan_type or plan_option.`);
       return new Response("Missing plan_type or plan_option", {
         status: 400,
         headers: { "Access-Control-Allow-Origin": "*" },
       });
     }
+    
+    const { plan_type, plan_option } = body as { plan_type: string, plan_option: string };
+    
     console.log(`[${EDGE_FUNCTION_NAME}] 📥 Requested plan_type="${plan_type}", plan_option="${plan_option}"`);
 
     const isOneTime = plan_type === "tokens";
@@ -228,9 +249,12 @@ serve(async (req: Request) => {
             });
           }
         }
-      } catch (err: any) {
-        console.error(`[${EDGE_FUNCTION_NAME}] ❌ Error checking current subscription: ${err.message}`);
-        await notifyTelegram(`${EDGE_FUNCTION_NAME} / ❌ Error checking current subscription: ${err.message}`);
+      } catch (err: unknown) {
+        const errorMessage = err instanceof Error ? err.message : String(err);
+        console.error(`[${EDGE_FUNCTION_NAME}] ❌ Error checking current subscription: ${errorMessage}`);
+        if (err instanceof Error) {
+          await notifyTelegram(`${EDGE_FUNCTION_NAME} / ❌ Error checking current subscription: ${errorMessage}`);
+        }
         return new Response("Internal server error", {
           status: 500,
           headers: { "Access-Control-Allow-Origin": "*" },
@@ -257,9 +281,12 @@ serve(async (req: Request) => {
         });
       }
       console.log(`[${EDGE_FUNCTION_NAME}] ✅ Found price_id=${priceRow.price_id} in table "${table}".`);
-    } catch (err: any) {
-      console.error(`[${EDGE_FUNCTION_NAME}] ❌ Error fetching price row: ${err.message}`);
-      await notifyTelegram(`${EDGE_FUNCTION_NAME} / ❌ Error fetching price row: ${err.message}`);
+    } catch (err: unknown) {
+      const errorMessage = err instanceof Error ? err.message : String(err);
+      console.error(`[${EDGE_FUNCTION_NAME}] ❌ Error fetching price row: ${errorMessage}`);
+      if (err instanceof Error) {
+        await notifyTelegram(`${EDGE_FUNCTION_NAME} / ❌ Error fetching price row: ${errorMessage}`);
+      }
       return new Response("Internal server error", {
         status: 500,
         headers: { "Access-Control-Allow-Origin": "*" },
@@ -290,9 +317,12 @@ serve(async (req: Request) => {
 
       session = await stripe.checkout.sessions.create(sessionParams);
       console.log(`[${EDGE_FUNCTION_NAME}] ✅ Stripe session created (id=${session.id}).`);
-    } catch (err: any) {
-      console.error(`[${EDGE_FUNCTION_NAME}] ❌ Error creating Stripe session: ${err.message}`);
-      await notifyTelegram(`${EDGE_FUNCTION_NAME} / ❌ Stripe session creation error: ${err.message}`);
+    } catch (err: unknown) {
+      const errorMessage = err instanceof Error ? err.message : String(err);
+      console.error(`[${EDGE_FUNCTION_NAME}] ❌ Error creating Stripe session: ${errorMessage}`);
+      if (err instanceof Error) {
+        await notifyTelegram(`${EDGE_FUNCTION_NAME} / ❌ Stripe session creation error: ${errorMessage}`);
+      }
       return new Response("Internal server error", {
         status: 500,
         headers: { "Access-Control-Allow-Origin": "*" },
@@ -305,10 +335,13 @@ serve(async (req: Request) => {
       headers: { "Content-Type": "application/json", ...corsHeaders },
     });
 
-  } catch (err: any) {
+  } catch (err: unknown) {
     // Catch-all for unexpected errors
-    console.error(`[${EDGE_FUNCTION_NAME}] ❌ Unexpected error: ${err.message}`);
-    await notifyTelegram(`${EDGE_FUNCTION_NAME} / ❌ Unexpected error: ${err.message}`);
+    const errorMessage = err instanceof Error ? err.message : String(err);
+    console.error(`[${EDGE_FUNCTION_NAME}] ❌ Unexpected error: ${errorMessage}`);
+    if (err instanceof Error) {
+      await notifyTelegram(`${EDGE_FUNCTION_NAME} / ❌ Unexpected error: ${errorMessage}`);
+    }
     return new Response("Internal server error", {
       status: 500,
       headers: { "Access-Control-Allow-Origin": "*" },

@@ -10,8 +10,8 @@ LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = public, pg_catalog AS $$
 DECLARE
-    service_key TEXT := 'service_role_key';  
-    edge_url    TEXT := 'https://YOUR_PROJECT_ID.supabase.co/functions/v1/run_subscription_maintenance';
+    service_key TEXT := 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InR0dHBmcHpnZW5ldXVvbm50aHR6Iiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc1NjE5NTExMCwiZXhwIjoyMDcxNzcxMTEwfQ.1rSimLghNGB7nucwkliIbIvOTODXvv6ataMNPt5jRhs';  
+    edge_url    TEXT := 'https://tttpfpzgeneuuonnthtz.supabase.co/functions/v1/run_subscription_maintenance';
 BEGIN
   RAISE NOTICE '📡 Trigger: run_subscription_maintenance...';
 

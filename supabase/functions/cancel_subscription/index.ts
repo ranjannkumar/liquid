@@ -32,7 +32,7 @@ if (!STRIPE_SECRET_KEY || !SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
   throw new Error("Missing required environment variables");
 }
 
-const stripe = new Stripe(STRIPE_SECRET_KEY, { apiVersion: "2023-10-16" });
+const stripe = new Stripe(STRIPE_SECRET_KEY, { apiVersion: "2025-07-30.basil" });
 const supabase: SupabaseClient = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
 const allowedOrigins = new Set([
@@ -66,7 +66,7 @@ async function notifyTelegram(message: string) {
     } else {
       console.log(`[${EDGE_FUNCTION_NAME}] 📢 Telegram notification sent.`);
     }
-  } catch (err) {
+  } catch (err: unknown) {
     console.error(`[${EDGE_FUNCTION_NAME}] ❌ Failed to send Telegram message: ${err}`);
   }
 }
@@ -104,17 +104,27 @@ serve(async (req: Request) => {
     // 2. Authenticate via JWT
     const authHeader = req.headers.get("Authorization") || "";
     const token = authHeader.replace("Bearer ", "");
-    let payload: any;
+    let payload: unknown; // Use 'unknown' instead of 'any'
     try {
       payload = JSON.parse(atob(token.split(".")[1]));
-    } catch (err) {
+    } catch (err: unknown) {
       console.warn(`[${EDGE_FUNCTION_NAME}] ⚠️ Failed to decode JWT: ${err}`);
       return new Response(JSON.stringify({ error: "Unauthorized" }), {
         status: 401,
         headers: corsHeaders,
       });
     }
-    const user_id = payload.sub;
+    
+    // Type guard to ensure payload has a 'sub' property
+    if (typeof payload !== 'object' || payload === null || !('sub' in payload)) {
+      console.warn(`[${EDGE_FUNCTION_NAME}] ⚠️ JWT missing sub claim or invalid payload.`);
+      return new Response(JSON.stringify({ error: "Unauthorized" }), {
+        status: 401,
+        headers: corsHeaders,
+      });
+    }
+
+    const user_id = (payload as { sub: string }).sub;
     if (!user_id) {
       console.warn(`[${EDGE_FUNCTION_NAME}] ⚠️ JWT missing sub claim.`);
       return new Response(JSON.stringify({ error: "Unauthorized" }), {
@@ -124,8 +134,7 @@ serve(async (req: Request) => {
     }
     console.log(`[${EDGE_FUNCTION_NAME}] 🔑 Authenticated user: ${user_id}`);
 
-    // 3. Find active subscription in Supabase
-    let activeSubId: string | null = null;
+    // 3. Find active subscription in Supabase and cancel it in Stripe
     try {
       const { data, error } = await supabase
         .from("subscriptions")
@@ -135,6 +144,7 @@ serve(async (req: Request) => {
         .order("created_at", { ascending: false })
         .limit(1)
         .single();
+
       if (error) throw error;
       if (!data?.stripe_subscription_id) {
         console.warn(`[${EDGE_FUNCTION_NAME}] ⚠️ Active subscription not found for user: ${user_id}`);
@@ -143,24 +153,20 @@ serve(async (req: Request) => {
           headers: corsHeaders,
         });
       }
-      activeSubId = data.stripe_subscription_id;
-      console.log(`[${EDGE_FUNCTION_NAME}] ✅ Found active subscription ID: ${activeSubId} for user: ${user_id}`);
-    } catch (err: any) {
-      console.error(`[${EDGE_FUNCTION_NAME}] ❌ Error fetching active subscription: ${err.message}`);
-      await notifyTelegram(`${EDGE_FUNCTION_NAME} / ❌ Error fetching active subscription for user=${user_id}: ${err.message}`);
-      return new Response(JSON.stringify({ error: "Internal server error" }), {
-        status: 500,
-        headers: corsHeaders,
-      });
-    }
 
-    // 4. Cancel at period end in Stripe
-    try {
+      const activeSubId = data.stripe_subscription_id;
+      console.log(`[${EDGE_FUNCTION_NAME}] ✅ Found active subscription ID: ${activeSubId} for user: ${user_id}`);
+      
+      // 4. Cancel at period end in Stripe
       await stripe.subscriptions.update(activeSubId, { cancel_at_period_end: true });
       console.log(`[${EDGE_FUNCTION_NAME}] 🎬 Scheduled cancellation for subscription ID: ${activeSubId}`);
-    } catch (err: any) {
-      console.error(`[${EDGE_FUNCTION_NAME}] ❌ Error scheduling cancellation: ${err.message}`);
-      await notifyTelegram(`${EDGE_FUNCTION_NAME} / ❌ Error scheduling cancellation for subscription=${activeSubId}: ${err.message}`);
+
+    } catch (err: unknown) { // Use 'unknown' to catch any type of error
+      const errorMessage = err instanceof Error ? err.message : "An unknown error occurred.";
+      console.error(`[${EDGE_FUNCTION_NAME}] ❌ Error scheduling cancellation: ${errorMessage}`);
+      if (err instanceof Error) {
+        await notifyTelegram(`${EDGE_FUNCTION_NAME} / ❌ Error scheduling cancellation for user=${user_id}: ${errorMessage}`);
+      }
       return new Response(JSON.stringify({ error: "Internal server error" }), {
         status: 500,
         headers: corsHeaders,
@@ -173,9 +179,12 @@ serve(async (req: Request) => {
       headers: { ...corsHeaders, "Content-Type": "application/json" },
     });
 
-  } catch (err: any) {
-    console.error(`[${EDGE_FUNCTION_NAME}] ❌ Unexpected error: ${err.message}`);
-    await notifyTelegram(`${EDGE_FUNCTION_NAME} / ❌ Unexpected error: ${err.message}`);
+  } catch (err: unknown) { // Use 'unknown' to catch any type of error
+    const errorMessage = err instanceof Error ? err.message : "An unexpected error occurred.";
+    console.error(`[${EDGE_FUNCTION_NAME}] ❌ Unexpected error: ${errorMessage}`);
+    if (err instanceof Error) {
+      await notifyTelegram(`${EDGE_FUNCTION_NAME} / ❌ Unexpected error: ${errorMessage}`);
+    }
     return new Response(JSON.stringify({ error: "Internal server error" }), {
       status: 500,
       headers: corsHeaders,

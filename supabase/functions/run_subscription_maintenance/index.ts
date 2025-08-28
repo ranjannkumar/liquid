@@ -59,7 +59,7 @@ async function notifyTelegram(message: string) {
     } else {
       console.log(`[${EDGE_FUNCTION_NAME}] 📢 Telegram notification sent.`);
     }
-  } catch (err) {
+  } catch (err: unknown) {
     console.error(`[${EDGE_FUNCTION_NAME}] ❌ Failed to send Telegram message: ${err}`);
   }
 }
@@ -106,10 +106,13 @@ serve(async (_req) => {
     }
     expiredBatches = data;
     console.log(`[${EDGE_FUNCTION_NAME}] 🔍 Found ${expiredBatches.length} expired token batch(es).`);
-  } catch (err: any) {
-    const errMsg = `[${EDGE_FUNCTION_NAME}] ❌ Error fetching expired token batches: ${err.message}`;
+  } catch (err: unknown) {
+    const errorMessage = err instanceof Error ? err.message : String(err);
+    const errMsg = `[${EDGE_FUNCTION_NAME}] ❌ Error fetching expired token batches: ${errorMessage}`;
     console.error(errMsg);
-    await notifyTelegram(`${EDGE_FUNCTION_NAME} / ❌ Failed to query expired token batches: ${err.message}`);
+    if (err instanceof Error) {
+      await notifyTelegram(`${EDGE_FUNCTION_NAME} / ❌ Failed to query expired token batches: ${errorMessage}`);
+    }
     return new Response("Error fetching expired token batches", { status: 500 });
   }
 
@@ -120,8 +123,9 @@ serve(async (_req) => {
         .update({ is_active: false })
         .eq("id", batch.id);
       console.log(`[${EDGE_FUNCTION_NAME}] ✅ Marked batch ${batch.id} as inactive.`);
-    } catch (err: any) {
-      console.warn(`[${EDGE_FUNCTION_NAME}] ⚠️ Failed to deactivate batch ${batch.id}: ${err.message}`);
+    } catch (err: unknown) { // Resolved error: `err` is of type 'unknown'
+      const errorMessage = err instanceof Error ? err.message : String(err);
+      console.warn(`[${EDGE_FUNCTION_NAME}] ⚠️ Failed to deactivate batch ${batch.id}: ${errorMessage}`);
       // Non-critical: continue with other batches
     }
   }
@@ -137,10 +141,13 @@ serve(async (_req) => {
     if (error) throw error;
     activeSubs = data;
     console.log(`[${EDGE_FUNCTION_NAME}] 🔍 Retrieved ${activeSubs.length} active subscription(s).`);
-  } catch (err: any) {
-    const errMsg = `[${EDGE_FUNCTION_NAME}] ❌ Error fetching active subscriptions: ${err.message}`;
+  } catch (err: unknown) { // Resolved error: `err` is of type 'unknown'
+    const errorMessage = err instanceof Error ? err.message : String(err);
+    const errMsg = `[${EDGE_FUNCTION_NAME}] ❌ Error fetching active subscriptions: ${errorMessage}`;
     console.error(errMsg);
-    await notifyTelegram(`${EDGE_FUNCTION_NAME} / ❌ Failed to query active subscriptions: ${err.message}`);
+    if (err instanceof Error) {
+      await notifyTelegram(`${EDGE_FUNCTION_NAME} / ❌ Failed to query active subscriptions: ${errorMessage}`);
+    }
     return new Response("Error fetching active subscriptions", { status: 500 });
   }
 
@@ -157,9 +164,10 @@ serve(async (_req) => {
         console.log(`[${EDGE_FUNCTION_NAME}] 🛑 Subscription expired for user ${sub.user_id} (sub_id: ${sub.id}).`);
         usersToUnset.add(sub.user_id);
         deactivatedCount += 1;
-      } catch (err: any) {
+      } catch (err: unknown) {
+        const errorMessage = err instanceof Error ? err.message : String(err);
         console.warn(
-          `[${EDGE_FUNCTION_NAME}] ⚠️ Failed to deactivate subscription ${sub.id}: ${err.message}`
+          `[${EDGE_FUNCTION_NAME}] ⚠️ Failed to deactivate subscription ${sub.id}: ${errorMessage}`
         );
         // Non-critical: continue processing other subscriptions
       }
@@ -175,9 +183,10 @@ serve(async (_req) => {
       console.log(
         `[${EDGE_FUNCTION_NAME}] ✅ Cleared active subscription flag for user ${userId}.`
       );
-    } catch (err: any) {
+    } catch (err: unknown) {
+      const errorMessage = err instanceof Error ? err.message : String(err);
       console.warn(
-        `[${EDGE_FUNCTION_NAME}] ⚠️ Failed to update user ${userId} flag: ${err.message}`
+        `[${EDGE_FUNCTION_NAME}] ⚠️ Failed to update user ${userId} flag: ${errorMessage}`
       );
       // Non-critical
     }
@@ -197,10 +206,13 @@ serve(async (_req) => {
     console.log(
       `[${EDGE_FUNCTION_NAME}] 🔍 Retrieved ${yearlySubs.length} active yearly subscription(s).`
     );
-  } catch (err: any) {
-    const errMsg = `[${EDGE_FUNCTION_NAME}] ❌ Error fetching yearly subscriptions: ${err.message}`;
+  } catch (err: unknown) {
+    const errorMessage = err instanceof Error ? err.message : String(err);
+    const errMsg = `[${EDGE_FUNCTION_NAME}] ❌ Error fetching yearly subscriptions: ${errorMessage}`;
     console.error(errMsg);
-    await notifyTelegram(`${EDGE_FUNCTION_NAME} / ❌ Failed to query yearly subscriptions: ${err.message}`);
+    if (err instanceof Error) {
+      await notifyTelegram(`${EDGE_FUNCTION_NAME} / ❌ Failed to query yearly subscriptions: ${errorMessage}`);
+    }
     return new Response("Error fetching yearly subscriptions", { status: 500 });
   }
 
@@ -228,9 +240,10 @@ serve(async (_req) => {
       console.log(
         `[${EDGE_FUNCTION_NAME}] 🔢 Retrieved ${tokensMonthly} tokens/month for plan ${sub.plan}.`
       );
-    } catch (err: any) {
+    } catch (err: unknown) {
+      const errorMessage = err instanceof Error ? err.message : String(err);
       console.error(
-        `[${EDGE_FUNCTION_NAME}] ❌ Skipping refill for subscription ${sub.id} due to token lookup error.`
+        `[${EDGE_FUNCTION_NAME}] ❌ Skipping refill for subscription ${sub.id} due to token lookup error: ${errorMessage}`
       );
       continue; // Skip this subscription but continue others
     }
@@ -259,8 +272,9 @@ serve(async (_req) => {
         `[${EDGE_FUNCTION_NAME}] 🎁 Issued ${tokensMonthly} tokens to user ${sub.user_id} (sub_id: ${sub.id}).`
       );
       tokensRefilledCount += 1;
-    } catch (err: any) {
-      const errMsg = `[${EDGE_FUNCTION_NAME}] ⚠️ Failed to insert token batch or update subscription ${sub.id}: ${err.message}`;
+    } catch (err: unknown) {
+      const errorMessage = err instanceof Error ? err.message : String(err);
+      const errMsg = `[${EDGE_FUNCTION_NAME}] ⚠️ Failed to insert token batch or update subscription ${sub.id}: ${errorMessage}`;
       console.warn(errMsg);
       // Non-critical: continue with other subscriptions
     }

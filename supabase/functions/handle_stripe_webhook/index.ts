@@ -35,7 +35,7 @@ if (!STRIPE_SECRET_KEY || !STRIPE_WEBHOOK_SECRET || !SUPABASE_URL || !SUPABASE_S
   throw new Error("Missing required environment variables");
 }
 
-const stripe = new Stripe(STRIPE_SECRET_KEY, { apiVersion: "2023-10-16" });
+const stripe = new Stripe(STRIPE_SECRET_KEY, { apiVersion: "2025-07-30.basil" });
 const supabase: SupabaseClient = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
 /**
@@ -65,8 +65,9 @@ async function notifyTelegram(message: string) {
     } else {
       console.log(`[${EDGE_FUNCTION_NAME}] 📢 Telegram notification sent.`);
     }
-  } catch (err) {
-    console.error(`[${EDGE_FUNCTION_NAME}] ❌ Failed to send Telegram message: ${err}`);
+  } catch (err: unknown) {
+    const errorMessage = err instanceof Error ? err.message : String(err);
+    console.error(`[${EDGE_FUNCTION_NAME}] ❌ Failed to send Telegram message: ${errorMessage}`);
   }
 }
 
@@ -92,7 +93,7 @@ async function getOneTimeTokenAmount(plan_option: string): Promise<number> {
     .from("token_prices")
     .select("tokens")
     .eq("plan_option", plan_option)
-    .eq("plan_type", "tokens")
+    .eq("plan_type", "one_time")
     .single();
 
   if (error || !data || typeof data.tokens !== "number") {
@@ -108,9 +109,12 @@ async function updateUserPaymentStatus(user_id: string, hasIssue: boolean) {
   try {
     await supabase.from("users").update({ has_payment_issue: hasIssue }).eq("user_id", user_id);
     console.log(`[${EDGE_FUNCTION_NAME}] 📝 Updated payment status for ${user_id} to hasIssue=${hasIssue}`);
-  } catch (err: any) {
-    console.error(`[${EDGE_FUNCTION_NAME}] ❌ Error updating payment status for ${user_id}: ${err.message}`);
-    await notifyTelegram(`${EDGE_FUNCTION_NAME} / ❌ Error updating payment status for ${user_id}: ${err.message}`);
+  } catch (err: unknown) {
+    const errorMessage = err instanceof Error ? err.message : String(err);
+    console.error(`[${EDGE_FUNCTION_NAME}] ❌ Error updating payment status for ${user_id}: ${errorMessage}`);
+    if (err instanceof Error) {
+      await notifyTelegram(`${EDGE_FUNCTION_NAME} / ❌ Error updating payment status for ${user_id}: ${errorMessage}`);
+    }
   }
 }
 
@@ -139,7 +143,7 @@ async function createOrUpdateSubscription(params: {
   try {
     tokenBase = await getSubscriptionTokenAmount(plan, billing_cycle);
     console.log(`[${EDGE_FUNCTION_NAME}] 🔢 Retrieved base tokens=${tokenBase} for plan=${plan}, billing_cycle=${billing_cycle}`);
-  } catch {
+  } catch (_err: unknown) {
     // getSubscriptionTokenAmount already notified
     throw new Error("Token lookup failed");
   }
@@ -160,8 +164,9 @@ async function createOrUpdateSubscription(params: {
       remainingOld = previousBatches.reduce((acc, b) => acc + (b.amount - b.consumed), 0);
       console.log(`[${EDGE_FUNCTION_NAME}] 🔍 Remaining tokens from old batches: ${remainingOld}`);
     }
-  } catch (err: any) {
-    console.warn(`[${EDGE_FUNCTION_NAME}] ⚠️ Error fetching previous batches for ${user_id}: ${err.message}`);
+  } catch (err: unknown) {
+    const errorMessage = err instanceof Error ? err.message : String(err);
+    console.warn(`[${EDGE_FUNCTION_NAME}] ⚠️ Error fetching previous batches for ${user_id}: ${errorMessage}`);
   }
 
   const tokensTotal = tokenBase * multiplier;
@@ -170,9 +175,12 @@ async function createOrUpdateSubscription(params: {
   try {
     await supabase.from("subscriptions").update({ is_active: false }).eq("user_id", user_id);
     console.log(`[${EDGE_FUNCTION_NAME}] ✅ Deactivated previous subscriptions for ${user_id}`);
-  } catch (err: any) {
-    console.error(`[${EDGE_FUNCTION_NAME}] ❌ Error deactivating previous subscriptions for ${user_id}: ${err.message}`);
-    await notifyTelegram(`${EDGE_FUNCTION_NAME} / ❌ Error deactivating subscriptions for ${user_id}: ${err.message}`);
+  } catch (err: unknown) {
+    const errorMessage = err instanceof Error ? err.message : String(err);
+    console.error(`[${EDGE_FUNCTION_NAME}] ❌ Error deactivating previous subscriptions for ${user_id}: ${errorMessage}`);
+    if (err instanceof Error) {
+      await notifyTelegram(`${EDGE_FUNCTION_NAME} / ❌ Error deactivating subscriptions for ${user_id}: ${errorMessage}`);
+    }
     throw new Error("Subscription deactivate failed");
   }
 
@@ -200,9 +208,12 @@ async function createOrUpdateSubscription(params: {
     }
     subInsertId = subInsert.id;
     console.log(`[${EDGE_FUNCTION_NAME}] 🎉 Created new subscription (id=${subInsertId}) for ${user_id}`);
-  } catch (err: any) {
-    console.error(`[${EDGE_FUNCTION_NAME}] ❌ Error inserting subscription for ${user_id}: ${err.message}`);
-    await notifyTelegram(`${EDGE_FUNCTION_NAME} / ❌ Error inserting subscription for ${user_id}: ${err.message}`);
+  } catch (err: unknown) {
+    const errorMessage = err instanceof Error ? err.message : String(err);
+    console.error(`[${EDGE_FUNCTION_NAME}] ❌ Error inserting subscription for ${user_id}: ${errorMessage}`);
+    if (err instanceof Error) {
+      await notifyTelegram(`${EDGE_FUNCTION_NAME} / ❌ Error inserting subscription for ${user_id}: ${errorMessage}`);
+    }
     throw new Error("Subscription insert failed");
   }
 
@@ -214,8 +225,9 @@ async function createOrUpdateSubscription(params: {
       .eq("user_id", user_id)
       .eq("source", "subscription");
     console.log(`[${EDGE_FUNCTION_NAME}] 🔄 Deactivated old token batches for ${user_id}`);
-  } catch (err: any) {
-    console.warn(`[${EDGE_FUNCTION_NAME}] ⚠️ Error deactivating old batches for ${user_id}: ${err.message}`);
+  } catch (err: unknown) {
+    const errorMessage = err instanceof Error ? err.message : String(err);
+    console.warn(`[${EDGE_FUNCTION_NAME}] ⚠️ Error deactivating old batches for ${user_id}: ${errorMessage}`);
   }
 
   // Insert new token batch with base + remainingOld
@@ -240,9 +252,12 @@ async function createOrUpdateSubscription(params: {
       expires_at: expiresAt,
     });
     console.log(`[${EDGE_FUNCTION_NAME}] 🎁 Inserted token batch (amount=${batchAmount}) for ${user_id}`);
-  } catch (err: any) {
-    console.error(`[${EDGE_FUNCTION_NAME}] ❌ Error inserting new token batch for ${user_id}: ${err.message}`);
-    await notifyTelegram(`${EDGE_FUNCTION_NAME} / ❌ Error inserting token batch for ${user_id}: ${err.message}`);
+  } catch (err: unknown) {
+    const errorMessage = err instanceof Error ? err.message : String(err);
+    console.error(`[${EDGE_FUNCTION_NAME}] ❌ Error inserting new token batch for ${user_id}: ${errorMessage}`);
+    if (err instanceof Error) {
+      await notifyTelegram(`${EDGE_FUNCTION_NAME} / ❌ Error inserting token batch for ${user_id}: ${errorMessage}`);
+    }
     throw new Error("Token batch insert failed");
   }
 
@@ -253,8 +268,9 @@ async function createOrUpdateSubscription(params: {
       .update({ has_active_subscription: true })
       .eq("user_id", user_id);
     console.log(`[${EDGE_FUNCTION_NAME}] ✅ Updated user.has_active_subscription=true for ${user_id}`);
-  } catch (err: any) {
-    console.warn(`[${EDGE_FUNCTION_NAME}] ⚠️ Error updating user flag for ${user_id}: ${err.message}`);
+  } catch (err: unknown) {
+    const errorMessage = err instanceof Error ? err.message : String(err);
+    console.warn(`[${EDGE_FUNCTION_NAME}] ⚠️ Error updating user flag for ${user_id}: ${errorMessage}`);
   }
 }
 
@@ -271,8 +287,9 @@ serve(async (req: Request) => {
   try {
     sig = req.headers.get("stripe-signature");
     rawBody = await req.text();
-  } catch (err: any) {
-    console.error(`[${EDGE_FUNCTION_NAME}] ❌ Error reading request body: ${err.message}`);
+  } catch (err: unknown) {
+    const errorMessage = err instanceof Error ? err.message : String(err);
+    console.error(`[${EDGE_FUNCTION_NAME}] ❌ Error reading request body: ${errorMessage}`);
     return new Response("Bad Request", { status: 400 });
   }
 
@@ -280,8 +297,9 @@ serve(async (req: Request) => {
   try {
     event = await stripe.webhooks.constructEventAsync(rawBody, sig!, STRIPE_WEBHOOK_SECRET!);
     console.log(`[${EDGE_FUNCTION_NAME}] ✅ Stripe event received: ${event.type}`);
-  } catch (err: any) {
-    console.error(`[${EDGE_FUNCTION_NAME}] ❌ Webhook signature verification failed: ${err.message}`);
+  } catch (err: unknown) {
+    const errorMessage = err instanceof Error ? err.message : String(err);
+    console.error(`[${EDGE_FUNCTION_NAME}] ❌ Webhook signature verification failed: ${errorMessage}`);
     return new Response("Webhook signature error", { status: 400 });
   }
 
@@ -290,12 +308,13 @@ serve(async (req: Request) => {
     const invoice = event.data.object as Stripe.Invoice;
     let user_id = invoice.metadata?.user_id as string | undefined;
 
-    if (!user_id && invoice.subscription) {
+    if (!user_id && 'subscription' in invoice && typeof invoice.subscription === 'string') {
       try {
-        const stripeSub = await stripe.subscriptions.retrieve(invoice.subscription.toString());
+        const stripeSub = await stripe.subscriptions.retrieve(invoice.subscription);
         user_id = stripeSub.metadata?.user_id!;
-      } catch (err: any) {
-        console.error(`[${EDGE_FUNCTION_NAME}] ❌ Failed to retrieve subscription metadata: ${err.message}`);
+      } catch (err: unknown) {
+        const errorMessage = err instanceof Error ? err.message : String(err);
+        console.error(`[${EDGE_FUNCTION_NAME}] ❌ Failed to retrieve subscription metadata: ${errorMessage}`);
       }
     }
 
@@ -325,9 +344,12 @@ serve(async (req: Request) => {
         .update({ has_active_subscription: false, has_payment_issue: true })
         .eq("user_id", user_id);
       console.log(`[${EDGE_FUNCTION_NAME}] 🔕 Subscription cancelled for ${user_id}`);
-    } catch (err: any) {
-      console.error(`[${EDGE_FUNCTION_NAME}] ❌ Error updating subscription/user flags for ${user_id}: ${err.message}`);
-      await notifyTelegram(`${EDGE_FUNCTION_NAME} / ❌ Error updating on subscription deletion for ${user_id}: ${err.message}`);
+    } catch (err: unknown) {
+      const errorMessage = err instanceof Error ? err.message : String(err);
+      console.error(`[${EDGE_FUNCTION_NAME}] ❌ Error updating subscription/user flags for ${user_id}: ${errorMessage}`);
+      if (err instanceof Error) {
+        await notifyTelegram(`${EDGE_FUNCTION_NAME} / ❌ Error updating on subscription deletion for ${user_id}: ${errorMessage}`);
+      }
     }
 
     return new Response("Subscription cancelled", { status: 200 });
@@ -336,14 +358,15 @@ serve(async (req: Request) => {
   // 4. Handle invoice.paid & customer.subscription.updated
   if (["invoice.paid", "customer.subscription.updated"].includes(event.type)) {
     const invoice = event.data.object as Stripe.Invoice;
-    if (!invoice.subscription) {
-      console.warn(`[${EDGE_FUNCTION_NAME}] ℹ️ invoice.paid event has no subscription ID`);
-      return new Response("No subscription", { status: 200 });
+    // Type check for subscription property
+    if (!('subscription' in invoice) || typeof invoice.subscription !== 'string') {
+        console.warn(`[${EDGE_FUNCTION_NAME}] ℹ️ invoice.paid event has no subscription ID`);
+        return new Response("No subscription", { status: 200 });
     }
 
     let user_id = "";
     try {
-      const subscription = await stripe.subscriptions.retrieve(invoice.subscription.toString());
+      const subscription = await stripe.subscriptions.retrieve(invoice.subscription);
       user_id = subscription.metadata?.user_id!;
       if (!user_id) {
         console.warn(`[${EDGE_FUNCTION_NAME}] ⚠️ Missing user_id in subscription metadata for paid event`);
@@ -362,9 +385,12 @@ serve(async (req: Request) => {
       });
 
       console.log(`[${EDGE_FUNCTION_NAME}] 📦 Subscription created/updated for ${user_id}`);
-    } catch (err: any) {
-      console.error(`[${EDGE_FUNCTION_NAME}] ❌ Error processing subscription/payout event: ${err.message}`);
-      await notifyTelegram(`${EDGE_FUNCTION_NAME} / ❌ Error processing subscription event: ${err.message}`);
+    } catch (err: unknown) {
+      const errorMessage = err instanceof Error ? err.message : String(err);
+      console.error(`[${EDGE_FUNCTION_NAME}] ❌ Error processing subscription/payout event: ${errorMessage}`);
+      if (err instanceof Error) {
+        await notifyTelegram(`${EDGE_FUNCTION_NAME} / ❌ Error processing subscription event: ${errorMessage}`);
+      }
     }
 
     return new Response("Subscription created/updated", { status: 200 });
@@ -449,9 +475,12 @@ serve(async (req: Request) => {
         });
 
         console.log(`[${EDGE_FUNCTION_NAME}] 🎉 One-time token purchase recorded for ${user_id}, amount=${tokensToAdd}`);
-      } catch (err: any) {
-        console.error(`[${EDGE_FUNCTION_NAME}] ❌ Error handling one-time purchase for ${user_id}: ${err.message}`);
-        await notifyTelegram(`${EDGE_FUNCTION_NAME} / ❌ Error handling purchase for ${user_id}: ${err.message}`);
+      } catch (err: unknown) {
+        const errorMessage = err instanceof Error ? err.message : String(err);
+        console.error(`[${EDGE_FUNCTION_NAME}] ❌ Error handling one-time purchase for ${user_id}: ${errorMessage}`);
+        if (err instanceof Error) {
+          await notifyTelegram(`${EDGE_FUNCTION_NAME} / ❌ Error handling purchase for ${user_id}: ${errorMessage}`);
+        }
         return new Response("Internal server error", { status: 500 });
       }
 
@@ -520,14 +549,20 @@ serve(async (req: Request) => {
               }
             }
           }
-        } catch (err: any) {
-          console.error(`[${EDGE_FUNCTION_NAME}] ❌ Error handling referral logic: ${err.message}`);
-          await notifyTelegram(`${EDGE_FUNCTION_NAME} / ❌ Error handling referral logic: ${err.message}`);
+        } catch (err: unknown) {
+          const errorMessage = err instanceof Error ? err.message : String(err);
+          console.error(`[${EDGE_FUNCTION_NAME}] ❌ Error handling referral logic: ${errorMessage}`);
+          if (err instanceof Error) {
+            await notifyTelegram(`${EDGE_FUNCTION_NAME} / ❌ Error handling referral logic: ${errorMessage}`);
+          }
         }
 
-      } catch (err: any) {
-        console.error(`[${EDGE_FUNCTION_NAME}] ❌ Error handling subscription checkout for ${user_id}: ${err.message}`);
-        await notifyTelegram(`${EDGE_FUNCTION_NAME} / ❌ Error handling subscription checkout for ${user_id}: ${err.message}`);
+      } catch (err: unknown) {
+        const errorMessage = err instanceof Error ? err.message : String(err);
+        console.error(`[${EDGE_FUNCTION_NAME}] ❌ Error handling subscription checkout for ${user_id}: ${errorMessage}`);
+        if (err instanceof Error) {
+          await notifyTelegram(`${EDGE_FUNCTION_NAME} / ❌ Error handling subscription checkout for ${user_id}: ${errorMessage}`);
+        }
         return new Response("Internal server error", { status: 500 });
       }
 
