@@ -8,6 +8,7 @@ CREATE TABLE IF NOT EXISTS public.users (
   created_at TIMESTAMP DEFAULT NOW(),                 -- When this row was first inserted
   user_id UUID NOT NULL UNIQUE,                       -- Supabase Auth user ID (links to auth.users.id)
   email TEXT NOT NULL UNIQUE,                         -- User’s email address (must be unique)
+  stripe_customer_id TEXT UNIQUE,                     -- Stripe Customer ID for billing
   has_active_subscription BOOLEAN DEFAULT FALSE,      -- “true” if user currently has a paid subscription
   has_payment_issue BOOLEAN DEFAULT FALSE,            -- “true” if there is a payment failure on their account
   is_deleted BOOLEAN DEFAULT FALSE                    -- Soft-delete flag; when true, treat as “blocked”

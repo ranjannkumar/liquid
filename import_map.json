@@ -1,0 +1,6 @@
+{
+  "imports": {
+    "sinon": "https://npm.esm.sh/sinon",
+    "stripe": "https://npm.esm.sh/stripe"
+  }
+}
