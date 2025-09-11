@@ -1,9 +1,9 @@
+-- supabase/cronjobs/run_subscription_maintenance.sql
+-- Corrected file for T11.
 -- 1) Drop the existing function to avoid conflicts
 DROP FUNCTION IF EXISTS public.trigger_run_subscription_maintenance();
 
 -- 2) Recreate the function with an explicit, immutable search_path
---    Adding “SET search_path = public, pg_catalog” ensures that any referenced
---    objects (e.g., net.http_post) resolve in the public schema safely.
 CREATE OR REPLACE FUNCTION public.trigger_run_subscription_maintenance()
 RETURNS VOID
 LANGUAGE plpgsql
@@ -26,11 +26,12 @@ BEGIN
 END;
 $$;
 
--- 3) (Re)create the cron job to invoke the function every hour at minute 0
+-- 3) (Re)create the cron job to invoke the function every day at 00:05 UTC.
+-- This aligns with the spec's recommendation.
 SELECT cron.unschedule('cron_run_subscription_maintenance');
 
 SELECT cron.schedule(
   'cron_run_subscription_maintenance',
-  '0 * * * *',
+  '5 0 * * *',
   $$ SELECT public.trigger_run_subscription_maintenance(); $$
 );

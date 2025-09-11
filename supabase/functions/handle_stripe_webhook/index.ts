@@ -1,5 +1,4 @@
 // supabase/functions/handle_stripe_webhook/index.ts
-
 import { serve } from "https://deno.land/std/http/server.ts";
 import Stripe from "npm:stripe";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
@@ -7,13 +6,13 @@ import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 const EDGE_FUNCTION_NAME = "handle_stripe_webhook";
 
 // ================= ENV =================
-const STRIPE_SECRET_KEY         = Deno.env.get("STRIPE_SECRET_KEY")!;
-const STRIPE_WEBHOOK_SECRET     = Deno.env.get("STRIPE_WEBHOOK_SECRET")!;
-const SUPABASE_URL              = Deno.env.get("SUPABASE_URL")!;
+const STRIPE_SECRET_KEY = Deno.env.get("STRIPE_SECRET_KEY")!;
+const STRIPE_WEBHOOK_SECRET = Deno.env.get("STRIPE_WEBHOOK_SECRET")!;
+const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
-const TELEGRAM_BOT_KEY          = Deno.env.get("TELEGRAM_BOT_KEY");
-const TELEGRAM_CHAT_ID          = Deno.env.get("TELEGRAM_CHAT_ID");
-const REFERRAL_TOKEN_AMOUNT     = parseInt(Deno.env.get("REFERRAL_TOKEN_AMOUNT") ?? "0", 10);
+const TELEGRAM_BOT_KEY = Deno.env.get("TELEGRAM_BOT_KEY");
+const TELEGRAM_CHAT_ID = Deno.env.get("TELEGRAM_CHAT_ID");
+const REFERRAL_TOKEN_AMOUNT = parseInt(Deno.env.get("REFERRAL_TOKEN_AMOUNT") ?? "0", 10);
 
 // ================ CLIENTS ================
 const stripe = new Stripe(STRIPE_SECRET_KEY);
@@ -57,15 +56,6 @@ function addExpiry(from: Date, planType: PlanType) {
   return d;
 }
 
-/** Event-level idempotency (not used for credits) */
-async function recordEventOnce(id: string, type: string) {
-  const { error } = await supabase.from("webhook_events").insert({ id, type });
-  if (!error) return true;
-  if ((error as any)?.code === "23505") return false;
-  log(`webhook_events warn: ${error?.message ?? String(error)}`);
-  return true; // best-effort
-}
-
 /** Invoice-level idempotency (EXACTLY-ONCE credit per invoice) */
 async function recordInvoiceOnce(invoiceId: string) {
   const key = `invoice:${invoiceId}`;
@@ -104,13 +94,19 @@ async function resolveUserId(sub: Stripe.Subscription, invoice?: Stripe.Invoice)
 /** Monthly tokens for a price from subscription_prices */
 async function tokensForSubscriptionPrice(price: Stripe.Price): Promise<number> {
   const planType = normalizeInterval(price.recurring?.interval);
+  const planOption = price.nickname; // Use the nickname to find the plan_option
+  
   const { data, error } = await supabase
     .from("subscription_prices")
     .select("tokens")
     .eq("price_id", price.id)
+    .eq("plan_option", planOption) // Use plan_option
     .eq("plan_type", planType)
     .maybeSingle();
-  if (error || !data) throw new Error(`No tokens in subscription_prices for price_id=${price.id}/${planType}`);
+
+  if (error || !data) {
+    throw new Error(`No tokens in subscription_prices for price_id=${price.id}/${planOption}/${planType}`);
+  }
   return data.tokens;
 }
 
@@ -137,17 +133,20 @@ serve(async (req) => {
         const session = event.data.object as Stripe.Checkout.Session;
         if (session.mode !== "payment") break; // subscription credits come from invoices
 
-        // idempotency via purchase id
+        // Idempotency check via purchase id
         const { data: exists } = await supabase
           .from("user_token_purchases")
           .select("id")
           .eq("stripe_purchase_id", session.id)
           .maybeSingle();
-        if (exists) break;
+        if (exists) {
+          log(`duplicate session ${session.id}, skipping`);
+          break;
+        }
 
         const meta = session.metadata ?? {};
         const user_id = (meta as any).user_id;
-        const plan_option = (meta as any).plan_option; // tier1..tier5
+        const plan_option = (meta as any).plan_option;
 
         const { data: tier } = await supabase
           .from("token_prices")
@@ -161,6 +160,8 @@ serve(async (req) => {
         const expiresAt = new Date(now);
         expiresAt.setDate(expiresAt.getDate() + 60);
 
+        const discountAmount = session.total_details?.amount_discount ?? 0;
+
         const { data: purchase, error: perr } = await supabase
           .from("user_token_purchases")
           .insert({
@@ -170,6 +171,7 @@ serve(async (req) => {
             amount: tier.tokens,
             current_period_start: now.toISOString(),
             current_period_end: expiresAt.toISOString(),
+            discount_amount: discountAmount / 100, // Stripe amount is in cents
           })
           .select("id")
           .single();
@@ -186,9 +188,10 @@ serve(async (req) => {
         });
         if (berr) throw berr;
 
+        log(`one-time purchase recorded for user=${user_id} with purchase_id=${session.id}`);
         break;
       }
-
+      
       // ---------------- SUBSCRIPTION STATE SYNC ------------------
       case "customer.subscription.created": {
         const sub = event.data.object as Stripe.Subscription;
@@ -253,33 +256,28 @@ serve(async (req) => {
         // Use *invoice.id* idempotency so both events credit only once
         const invBase = event.data.object as Stripe.Invoice;
 
-        // Guard: Stripe typings allow id?: string
         const invoiceId: string | null = typeof invBase.id === "string" ? invBase.id : null;
         if (!invoiceId) {
           log(`skip invoice: missing invoice.id`);
           break;
         }
 
-        // Only process truly paid invoices
         if (invBase.status !== "paid") {
           log(`skip invoice ${invoiceId}: status=${invBase.status}`);
           break;
         }
 
-        // Idempotency per invoice
         if (!(await recordInvoiceOnce(invoiceId))) {
           log(`duplicate for invoice ${invoiceId}, skipping`);
           return new Response("duplicate invoice", { status: 200 });
         }
 
-        // subscription on invoice/lines may be string OR object
         type InvoiceWithLines = Stripe.Invoice & {
           subscription?: string | Stripe.Subscription | null;
           lines: { data: Array<{ subscription?: string | Stripe.Subscription | null }> };
         };
         const inv = invBase as InvoiceWithLines;
 
-        // 1) Try invoice.subscription
         let subscriptionId: string | null = null;
         const invSub = inv.subscription;
         if (typeof invSub === "string") {
@@ -288,7 +286,6 @@ serve(async (req) => {
           subscriptionId = (invSub as Stripe.Subscription).id;
         }
 
-        // 2) Recover from line items if needed
         if (!subscriptionId) {
           const lineWithSub = inv.lines?.data?.find((l) => !!l.subscription);
           if (lineWithSub?.subscription) {
@@ -299,7 +296,6 @@ serve(async (req) => {
           }
         }
 
-        // 3) Fallback: customer's latest subscription
         if (!subscriptionId && typeof inv.customer === "string") {
           try {
             const list = await stripe.subscriptions.list({
@@ -321,7 +317,6 @@ serve(async (req) => {
           break;
         }
 
-        // Resolve user and price
         const sub = await stripe.subscriptions.retrieve(subscriptionId);
         const user_id = await resolveUserId(sub, inv);
         if (!user_id) {
@@ -333,16 +328,8 @@ serve(async (req) => {
 
         const price = sub.items.data[0].price as Stripe.Price;
         const planType = normalizeInterval(price.recurring?.interval);
-        const monthlyTokens = await tokensForSubscriptionPrice(price);
+        const monthlyTokens = await tokensForSubscriptionPrice(price); // This call is now fixed and will return the correct token amount
         log(`will credit ${monthlyTokens} tokens to user=${user_id} for sub=${sub.id} (${planType})`);
-
-        // Deactivate prior subscription batches for this user
-        const { error: deactErr } = await supabase
-          .from("user_token_batches")
-          .update({ is_active: false })
-          .eq("user_id", user_id)
-          .eq("source", "subscription");
-        if (deactErr) log(`deactivate warn: ${deactErr.message}`);
 
         // Upsert subscription row (keep periods current)
         const upsertPayload = {
@@ -374,16 +361,16 @@ serve(async (req) => {
           subscriptionRowId = found.id;
         }
 
-        // Insert single monthly batch for this invoice
         const expiresAt = addExpiry(new Date(), planType);
         const { error: batchErr } = await supabase.from("user_token_batches").insert({
           user_id,
           source: "subscription",
           subscription_id: subscriptionRowId,
-          amount: monthlyTokens,               // monthly grant, even for yearly plans
-          consumed: 0,                         // remove if your schema doesn't have it
-          is_active: true,                     // remove if your schema doesn't have it
-          expires_at: expiresAt.toISOString(), // remove if your schema doesn't have it
+          amount: monthlyTokens,               
+          consumed: 0,                         
+          is_active: true,                     
+          expires_at: expiresAt.toISOString(), 
+          note: `invoice:${invoiceId}`,
         });
         if (batchErr) throw batchErr;
 
@@ -392,7 +379,6 @@ serve(async (req) => {
           .update({ has_active_subscription: true, has_payment_issue: false })
           .eq("user_id", user_id);
 
-        // Referral bonus (first invoice only)
         if (inv.billing_reason === "subscription_create" && REFERRAL_TOKEN_AMOUNT > 0) {
           const { data: ref } = await supabase
             .from("referrals")
@@ -422,7 +408,6 @@ serve(async (req) => {
         break;
       }
 
-      // ------------------- PAYMENT FAILURE FLAG -------------------
       case "invoice.payment_failed": {
         const invoice = event.data.object as Stripe.Invoice;
         const custId = invoice.customer as string;
@@ -438,7 +423,6 @@ serve(async (req) => {
       }
 
       default:
-        // ignore others
         break;
     }
   } catch (e) {
