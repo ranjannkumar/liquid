@@ -80,11 +80,17 @@ serve(async (req) => {
     }
 
     const mode: "payment" | "subscription" = isOneTime ? "payment" : "subscription";
+    
+    // Check if we need to create a new Stripe customer
+    const stripeCustomerId = user?.stripe_customer_id || undefined;
+    if (!stripeCustomerId) {
+      console.log(`[${EDGE_FUNCTION_NAME}] No existing Stripe customer found. A new one will be created.`);
+    }
 
     const session = await stripe.checkout.sessions.create({
       mode,
-      customer: user?.stripe_customer_id || undefined,
-      customer_email: user?.stripe_customer_id ? undefined : email,
+      customer: stripeCustomerId,
+      customer_email: stripeCustomerId ? undefined : email,
       line_items: [{ price: priceRow.price_id, quantity: 1 }],
       success_url: `${DOMAIN}/payment/success?session_id={CHECKOUT_SESSION_ID}`,
       cancel_url: `${DOMAIN}/payment/cancelled`,

@@ -54,10 +54,12 @@ serve(async () => {
       const { data: tokenRow } = await supabase
         .from("subscription_prices")
         .select("tokens")
-        .eq("price_id", s.plan)
-        .eq("plan_type", "yearly")
+        .eq("price_id", s.plan) // Corrected to use price_id
         .maybeSingle();
-      if (!tokenRow) continue;
+      if (!tokenRow) {
+        console.warn(`[${EDGE_FUNCTION_NAME}] ⚠️ Skipping refill for sub ${s.id}: token lookup failed.`);
+        continue;
+      }
 
       const expires = new Date();
       expires.setMonth(expires.getMonth() + 1);

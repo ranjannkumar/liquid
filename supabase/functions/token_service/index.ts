@@ -1,5 +1,4 @@
 // supabase/functions/token_service/index.ts
-// This is a new file to address T10
 import { serve } from "https://deno.land/std/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
@@ -9,15 +8,12 @@ const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
-// supabase/functions/token_service/index.ts
-
 async function consumeTokens(user_id: string, amount: number, reason: string): Promise<number> {
   const { data: batches, error } = await supabase
     .from("user_token_batches")
-    .select("id, consumed, available, expires_at") // Add 'consumed' to the select statement
+    .select("id, consumed, consumed_pending, amount, expires_at")
     .eq("user_id", user_id)
     .eq("is_active", true)
-    .gt("available", 0)
     .order("expires_at", { ascending: true });
 
   if (error || !batches) {
@@ -25,26 +21,44 @@ async function consumeTokens(user_id: string, amount: number, reason: string): P
   }
 
   let remaining = amount;
-  for (const batch of batches) {
-    const consumption = Math.min(remaining, batch.available);
-    if (consumption > 0) {
-      await supabase.from("user_token_batches")
-        .update({ consumed: batch.consumed + consumption })
-        .eq("id", batch.id);
-
-      await supabase.from("token_event_logs").insert({
-        user_id,
-        batch_id: batch.id,
-        delta: -consumption,
-        reason,
-      });
-
-      remaining -= consumption;
+  
+  // Use a transaction for atomicity
+  const { error: txError } = await supabase.rpc('start_transaction');
+  if (txError) throw txError;
+  
+  try {
+    for (const batch of batches) {
+      const available = batch.amount - batch.consumed - batch.consumed_pending;
+      const consumption = Math.min(remaining, available);
+      if (consumption > 0) {
+        // Tentatively consume tokens by updating consumed_pending
+        const { error: updateError } = await supabase.from("user_token_batches")
+          .update({ consumed_pending: batch.consumed_pending + consumption })
+          .eq("id", batch.id);
+        if (updateError) throw updateError;
+        
+        remaining -= consumption;
+      }
+      if (remaining === 0) break;
     }
-    if (remaining === 0) break;
+    
+    // If successful, commit the transaction and finalize consumption
+    await supabase.rpc('commit_transaction');
+    
+    // Now, move pending to consumed and log
+    const finalConsumed = amount - remaining;
+    await supabase.rpc('finalize_consumption', {
+      user_id,
+      amount: finalConsumed,
+      reason
+    });
+    
+    return finalConsumed;
+    
+  } catch (e: unknown) {
+    await supabase.rpc('rollback_transaction');
+    throw e;
   }
-
-  return amount - remaining;
 }
 
 

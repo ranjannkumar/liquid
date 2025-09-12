@@ -1,5 +1,4 @@
 // supabase/functions/reconciliation/index.ts
-// This is a new file to address T14
 import { serve } from "https://deno.land/std/http/server.ts";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import Stripe from "npm:stripe";
@@ -29,6 +28,11 @@ serve(async () => {
       }
     }
     
+    const { data: dbTokenBatches, error: tokenError } = await supabase
+      .from("user_token_total")
+      .select("user_id, total_available");
+    if (tokenError) throw tokenError;
+
     // This is a placeholder for a more complete reconciliation job
     // It should also compare token amounts, payment issues, etc.
     if (issues.length > 0) {
