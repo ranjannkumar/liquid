@@ -12,69 +12,97 @@ serve(async () => {
   const thisMonth = now.getMonth();
   const thisYear = now.getFullYear();
 
-  // 1) Expire batches
-  const { data: expired } = await supabase
-    .from("user_token_batches")
-    .select("id")
-    .eq("is_active", true)
-    .lt("expires_at", now.toISOString());
-  if (expired) {
-    for (const b of expired) {
-      await supabase.from("user_token_batches").update({ is_active: false }).eq("id", b.id);
-    }
-  }
-
-  // 2) Deactivate subscriptions past period end
-  const { data: activeSubs } = await supabase
-    .from("subscriptions")
-    .select("id, user_id, current_period_end")
-    .eq("is_active", true);
-  if (activeSubs) {
-    for (const s of activeSubs) {
-      if (s.current_period_end && new Date(s.current_period_end) < now) {
-        await supabase.from("subscriptions").update({ is_active: false }).eq("id", s.id);
-        await supabase.from("users").update({ has_active_subscription: false }).eq("user_id", s.user_id);
+  try {
+    // 1) Expire batches
+    const { data: expired, error: expiredError } = await supabase
+      .from("user_token_batches")
+      .select("id")
+      .eq("is_active", true)
+      .lt("expires_at", now.toISOString());
+    if (expiredError) throw expiredError;
+    if (expired) {
+      for (const b of expired) {
+        await supabase.from("user_token_batches").update({ is_active: false }).eq("id", b.id);
       }
     }
-  }
 
-  // 3) Yearly safety-net monthly refill (idempotent by month)
-  const { data: yearly } = await supabase
-    .from("subscriptions")
-    .select("id, user_id, plan, last_monthly_refill")
-    .eq("billing_cycle", "yearly")
-    .eq("is_active", true);
-
-  if (yearly) {
-    for (const s of yearly) {
-      const last = s.last_monthly_refill ? new Date(s.last_monthly_refill) : null;
-      const already = last && last.getMonth() === thisMonth && last.getFullYear() === thisYear;
-      if (already) continue;
-
-      const { data: tokenRow } = await supabase
-        .from("subscription_prices")
-        .select("tokens")
-        .eq("price_id", s.plan) // Corrected to use price_id
-        .maybeSingle();
-      if (!tokenRow) {
-        console.warn(`[${EDGE_FUNCTION_NAME}] ⚠️ Skipping refill for sub ${s.id}: token lookup failed.`);
-        continue;
+    // 2) Deactivate subscriptions past period end
+    const { data: activeSubs, error: activeSubsError } = await supabase
+      .from("subscriptions")
+      .select("id, user_id, current_period_end")
+      .eq("is_active", true);
+    if (activeSubsError) throw activeSubsError;
+    if (activeSubs) {
+      for (const s of activeSubs) {
+        if (s.current_period_end && new Date(s.current_period_end) < now) {
+          await supabase.from("subscriptions").update({ is_active: false }).eq("id", s.id);
+          await supabase.from("users").update({ has_active_subscription: false }).eq("user_id", s.user_id);
+        }
       }
-
-      const expires = new Date();
-      expires.setMonth(expires.getMonth() + 1);
-      await supabase.from("user_token_batches").insert({
-        user_id: s.user_id,
-        source: "subscription",
-        subscription_id: s.id,
-        amount: tokenRow.tokens,
-        consumed: 0,
-        is_active: true,
-        expires_at: expires.toISOString(),
-        note: "yearly-monthly-refill (cron)",
-      });
-      await supabase.from("subscriptions").update({ last_monthly_refill: now.toISOString() }).eq("id", s.id);
     }
+
+    // 3) Yearly safety-net monthly refill (idempotent by month)
+    const { data: yearly, error: yearlyError } = await supabase
+      .from("subscriptions")
+      .select("id, user_id, plan_option, last_monthly_refill")
+      .eq("billing_cycle", "yearly")
+      .eq("is_active", true);
+    if (yearlyError) throw yearlyError;
+
+    if (yearly) {
+      for (const s of yearly) {
+        const last = s.last_monthly_refill ? new Date(s.last_monthly_refill) : null;
+        const already = last && last.getMonth() === thisMonth && last.getFullYear() === thisYear;
+        if (already) continue;
+
+        const { data: tokenRow, error: tokenError } = await supabase
+          .from("subscription_prices")
+          .select("tokens, monthly_refill_tokens")
+          .eq("plan_option", s.plan_option)
+          .maybeSingle();
+        if (tokenError || !tokenRow) {
+          console.warn(`[${EDGE_FUNCTION_NAME}] ⚠️ Skipping refill for sub ${s.id}: token lookup failed.`);
+          continue;
+        }
+
+        const monthlyTokens = tokenRow.monthly_refill_tokens || Math.floor(tokenRow.tokens / 12);
+        
+        const expires = new Date();
+        expires.setMonth(expires.getMonth() + 1);
+
+        // Transactional logic to ensure both operations succeed or fail together
+        try {
+          const { error: batchInsertError } = await supabase.from("user_token_batches").insert({
+            user_id: s.user_id,
+            source: "subscription",
+            subscription_id: s.id,
+            amount: monthlyTokens,
+            consumed: 0,
+            is_active: true,
+            expires_at: expires.toISOString(),
+            note: "yearly-monthly-refill (cron)",
+          });
+
+          if (batchInsertError) {
+            console.error(`[${EDGE_FUNCTION_NAME}] ❌ Failed to insert token batch for sub ${s.id}:`, batchInsertError);
+            throw batchInsertError;
+          }
+
+          const { error: updateError } = await supabase.from("subscriptions").update({ last_monthly_refill: now.toISOString() }).eq("id", s.id);
+          if (updateError) {
+            console.error(`[${EDGE_FUNCTION_NAME}] ❌ Failed to update last_monthly_refill for sub ${s.id}:`, updateError);
+            throw updateError;
+          }
+        } catch (e) {
+            console.error(`[${EDGE_FUNCTION_NAME}] ❌ Refill process failed for subscription ${s.id}:`, e);
+            // Continue to next subscription to prevent one failure from stopping the entire cron job
+            continue;
+        }
+      }
+    }
+  } catch (e) {
+    console.error(`[${EDGE_FUNCTION_NAME}] ❌ An unexpected error occurred in the cron job:`, e);
+    return new Response("Internal Server Error", { status: 500 });
   }
 
   return new Response("ok", { status: 200 });
