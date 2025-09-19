@@ -8,66 +8,40 @@ const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
+/**
+ * Consumes tokens atomically using a database RPC.
+ * This replaces the flawed client-side transaction logic.
+ */
 async function consumeTokens(user_id: string, amount: number, reason: string): Promise<number> {
-  const { data: batches, error } = await supabase
-    .from("user_token_batches")
-    .select("id, consumed, consumed_pending, amount, expires_at")
-    .eq("user_id", user_id)
-    .eq("is_active", true)
-    .order("expires_at", { ascending: true });
+  const { data, error } = await supabase.rpc('consume_tokens', {
+    p_user_id: user_id,
+    p_amount: amount,
+    p_reason: reason
+  });
 
-  if (error || !batches) {
-    throw new Error("Failed to fetch batches.");
+  if (error) {
+    console.error(`[${EDGE_FUNCTION_NAME}] RPC call failed:`, error);
+    throw new Error(`Token consumption failed: ${error.message}`);
   }
-
-  let remaining = amount;
   
-  // Use a transaction for atomicity
-  const { error: txError } = await supabase.rpc('start_transaction');
-  if (txError) throw txError;
-  
-  try {
-    for (const batch of batches) {
-      const available = batch.amount - batch.consumed - batch.consumed_pending;
-      const consumption = Math.min(remaining, available);
-      if (consumption > 0) {
-        // Tentatively consume tokens by updating consumed_pending
-        const { error: updateError } = await supabase.from("user_token_batches")
-          .update({ consumed_pending: batch.consumed_pending + consumption })
-          .eq("id", batch.id);
-        if (updateError) throw updateError;
-        
-        remaining -= consumption;
-      }
-      if (remaining === 0) break;
-    }
-    
-    // If successful, commit the transaction and finalize consumption
-    await supabase.rpc('commit_transaction');
-    
-    // Now, move pending to consumed and log
-    const finalConsumed = amount - remaining;
-    await supabase.rpc('finalize_consumption', {
-      user_id,
-      amount: finalConsumed,
-      reason
-    });
-    
-    return finalConsumed;
-    
-  } catch (e: unknown) {
-    await supabase.rpc('rollback_transaction');
-    throw e;
-  }
+  return data;
 }
-
 
 serve(async (req) => {
   if (req.method !== "POST") return new Response("Method Not Allowed", { status: 405 });
-  const { user_id, amount, reason } = await req.json();
+  
+  let user_id: string, amount: number, reason: string;
+  try {
+    const body = await req.json();
+    user_id = body.user_id;
+    amount = body.amount;
+    reason = body.reason;
+  } catch (e) {
+    return new Response("Invalid JSON body", { status: 400 });
+  }
 
-  if (!user_id || !amount || !reason) {
-    return new Response("Missing parameters", { status: 400 });
+  if (!user_id || typeof amount !== 'number' || !reason) {
+    return new Response("Missing or invalid parameters", { status: 400 });
   }
 
   try {

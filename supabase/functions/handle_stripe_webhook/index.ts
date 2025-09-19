@@ -237,6 +237,14 @@ serve(async (req) => {
           expires_at: expiresAt.toISOString(),
         });
         if (berr) throw berr;
+        
+        // Log the token credit
+        await supabase.from("token_event_logs").insert({
+          user_id,
+          batch_id: purchase.id,
+          delta: tier.tokens,
+          reason: "purchase",
+        });
 
         log(`one-time purchase recorded for user=${user_id} purchase_id=${session.id}`);
         break;
@@ -255,19 +263,22 @@ serve(async (req) => {
 
         const price = sub.items.data[0].price as Stripe.Price;
         const cycle: DbCycle = dbCycleFromStripe(price.recurring?.interval ?? "month");
-        const { price: catalogPrice } = await getSubscriptionCatalog(price.id);
+        const { price: catalogPrice, tokens: catalogTokens } = await getSubscriptionCatalog(price.id);
         const amountCents = subscriptionAmountCents(catalogPrice, price);
 
+        if (catalogTokens === null) throw new Error(`Tokens not found for price_id: ${price.id}`);
+
         const payload = {
-          user_id,
-          plan: price.id,                             // Stripe price_id
-          billing_cycle: cycle,                       // 'daily' | 'monthly' | 'yearly'
-          stripe_subscription_id: sub.id,
-          is_active: true,
-          amount: amountCents,                        // INT NOT NULL
-          current_period_start: epochToIso((sub as any).current_period_start),
-          current_period_end:   epochToIso((sub as any).current_period_end),
-          last_monthly_refill:  cycle === "yearly" ? new Date().toISOString() : null,
+            user_id,
+            plan: price.id,
+            billing_cycle: cycle,
+            stripe_subscription_id: sub.id,
+            is_active: sub.status === "active",
+            amount: catalogTokens,         // Correctly store tokens here
+            price_in_cents: amountCents,   // Store price in the new column
+            current_period_start: epochToIso((sub as any).current_period_start),
+            current_period_end: epochToIso((sub as any).current_period_end),
+            last_monthly_refill: cycle === "yearly" ? new Date().toISOString() : null,
         };
 
         const { error } = await supabase
@@ -290,15 +301,18 @@ serve(async (req) => {
         const price = sub.items.data[0].price as Stripe.Price;
         const cycle: DbCycle = dbCycleFromStripe(price.recurring?.interval ?? "month");
 
-        const { price: catalogPrice } = await getSubscriptionCatalog(price.id);
+        const { price: catalogPrice, tokens: catalogTokens } = await getSubscriptionCatalog(price.id);
         const amountCents = subscriptionAmountCents(catalogPrice, price);
+
+        if (catalogTokens === null) throw new Error(`Tokens not found for price_id: ${price.id}`);
 
         const { error } = await supabase
           .from("subscriptions")
           .update({
             plan: price.id,
             billing_cycle: cycle,
-            amount: amountCents,
+            tokens: catalogTokens,
+            price: amountCents,
             current_period_start: epochToIso((sub as any).current_period_start),
             current_period_end:   epochToIso((sub as any).current_period_end),
             is_active: sub.status === "active",
@@ -321,6 +335,7 @@ serve(async (req) => {
 
         const localId = await getLocalSubscriptionId(sub.id);
         if (localId) {
+          // Deactivate related token batches as per spec
           await supabase
             .from("user_token_batches")
             .update({ is_active: false })
@@ -407,7 +422,7 @@ serve(async (req) => {
         // Link token batch to local subscription row UUID
         const localSubId = await getLocalSubscriptionId(sub.id);
 
-        await supabase.from("user_token_batches").insert({
+        const { data: newBatch, error: batchError } = await supabase.from("user_token_batches").insert({
           user_id,
           source: "subscription",
           subscription_id: localSubId ?? null,
@@ -415,6 +430,16 @@ serve(async (req) => {
           consumed: 0,
           is_active: true,
           expires_at: expiresAtIso, // <-- period-end based expiry
+        }).select("id").single();
+        
+        if (batchError) throw batchError;
+
+        // Log the token credit
+        await supabase.from("token_event_logs").insert({
+          user_id,
+          batch_id: newBatch.id,
+          delta: monthlyTokens,
+          reason: "subscription_refill",
         });
 
         await supabase
@@ -431,16 +456,22 @@ serve(async (req) => {
             .maybeSingle();
           if (ref && !ref.is_rewarded) {
             const exp = new Date(); exp.setDate(exp.getDate() + 365);
-            const { error: refErr } = await supabase.from("user_token_batches").insert({
+            const { data: refBatch, error: refErr } = await supabase.from("user_token_batches").insert({
               user_id: ref.referrer_user_id,
               source: "referral",
               amount: REFERRAL_TOKEN_AMOUNT,
               consumed: 0,
               is_active: true,
               expires_at: exp.toISOString(),
-            });
+            }).select("id").single();
             if (!refErr) {
               await supabase.from("referrals").update({ is_rewarded: true }).eq("id", ref.id);
+              await supabase.from("token_event_logs").insert({
+                user_id: ref.referrer_user_id,
+                batch_id: refBatch.id,
+                delta: REFERRAL_TOKEN_AMOUNT,
+                reason: "referral_bonus",
+              });
             } else {
               log(`referral insert failed: ${stringifyErr(refErr)}`);
             }

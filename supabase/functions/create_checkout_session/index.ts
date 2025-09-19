@@ -92,6 +92,7 @@ serve(async (req) => {
       customer: stripeCustomerId,
       customer_email: stripeCustomerId ? undefined : email,
       line_items: [{ price: priceRow.price_id, quantity: 1 }],
+      allow_promotion_codes: true, 
       success_url: `${DOMAIN}/payment/success?session_id={CHECKOUT_SESSION_ID}`,
       cancel_url: `${DOMAIN}/payment/cancelled`,
       metadata: { user_id, plan_type, plan_option },

@@ -27,8 +27,7 @@ const supabase: SupabaseClient = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROL
 
 function getCorsHeaders(origin: string): HeadersInit {
   const allowedOrigins = new Set([
-    "https://localhost",
-    DOMAIN,
+    DOMAIN
   ]);
   const finalOrigin = allowedOrigins.has(origin) ? origin : DOMAIN;
   return {
@@ -119,6 +118,8 @@ serve(async (req: Request) => {
     console.log(`[${EDGE_FUNCTION_NAME}] 🔑 Authenticated user: ${user_id}`);
 
     try {
+      const { cancel_immediately = false } = await req.json();
+
       const { data, error } = await supabase
         .from("subscriptions")
         .select("stripe_subscription_id")
@@ -140,8 +141,22 @@ serve(async (req: Request) => {
       const activeSubId = data.stripe_subscription_id;
       console.log(`[${EDGE_FUNCTION_NAME}] ✅ Found active subscription ID: ${activeSubId} for user: ${user_id}`);
 
-      await stripe.subscriptions.update(activeSubId, { cancel_at_period_end: true });
-      console.log(`[${EDGE_FUNCTION_NAME}] 🎬 Scheduled cancellation for subscription ID: ${activeSubId}`);
+      if (cancel_immediately) {
+        // T8: Immediate cancel. Corrected to use a direct fetch request.
+        const stripeApiUrl = `https://api.stripe.com/v1/subscriptions/${activeSubId}`;
+        await fetch(stripeApiUrl, {
+          method: 'DELETE',
+          headers: {
+            'Authorization': `Bearer ${STRIPE_SECRET_KEY}`,
+            'Content-Type': 'application/x-www-form-urlencoded',
+          },
+        });
+        console.log(`[${EDGE_FUNCTION_NAME}] 🗑️ Immediately canceled subscription ID: ${activeSubId}`);
+      } else {
+        // T7: Cancel at period end (default)
+        await stripe.subscriptions.update(activeSubId, { cancel_at_period_end: true });
+        console.log(`[${EDGE_FUNCTION_NAME}] 🎬 Scheduled cancellation for subscription ID: ${activeSubId}`);
+      }
 
     } catch (err: unknown) {
       const errorMessage = err instanceof Error ? err.message : "An unknown error occurred.";
