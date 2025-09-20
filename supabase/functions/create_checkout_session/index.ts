@@ -65,7 +65,7 @@ serve(async (req) => {
       return new Response("Missing plan_type or plan_option", { status: 400, headers: corsHeaders });
     }
 
-    const isOneTime = plan_type === "one_time" || plan_type === "daily";
+    const isOneTime = plan_type === "one_time";
     const table = isOneTime ? "token_prices" : "subscription_prices";
 
     const { data: priceRow, error: priceErr } = await supabase
@@ -92,7 +92,7 @@ serve(async (req) => {
       customer: stripeCustomerId,
       customer_email: stripeCustomerId ? undefined : email,
       line_items: [{ price: priceRow.price_id, quantity: 1 }],
-      allow_promotion_codes: true, 
+      allow_promotion_codes: true,
       success_url: `${DOMAIN}/payment/success?session_id={CHECKOUT_SESSION_ID}`,
       cancel_url: `${DOMAIN}/payment/cancelled`,
       metadata: { user_id, plan_type, plan_option },
