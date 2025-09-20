@@ -288,24 +288,25 @@ serve(async (req) => {
           .select("id").single();
         if (error) throw error;
         
-        // Proactively insert the first token batch to prevent race condition
-        const { data: newBatch, error: batchError } = await supabase.from("user_token_batches").insert({
-          user_id,
-          source: "subscription",
-          subscription_id: newSub.id,
-          amount: catalogTokens,
-          consumed: 0,
-          is_active: true,
-          expires_at: epochToIso((sub as any).current_period_end)!,
-        }).select("id").single();
-        if (batchError) throw batchError;
+        // This is the bug. The initial token batch should be created on invoice.paid, not here.
+        // It's commented out to fix the double-granting issue.
+        // const { data: newBatch, error: batchError } = await supabase.from("user_token_batches").insert({
+        //   user_id,
+        //   source: "subscription",
+        //   subscription_id: newSub.id,
+        //   amount: catalogTokens,
+        //   consumed: 0,
+        //   is_active: true,
+        //   expires_at: epochToIso((sub as any).current_period_end)!,
+        // }).select("id").single();
+        // if (batchError) throw batchError;
         
-        await supabase.from("token_event_logs").insert({
-          user_id,
-          batch_id: newBatch.id,
-          delta: catalogTokens,
-          reason: "subscription_initial_credit",
-        });
+        // await supabase.from("token_event_logs").insert({
+        //   user_id,
+        //   batch_id: newBatch.id,
+        //   delta: catalogTokens,
+        //   reason: "subscription_initial_credit",
+        // });
 
         await supabase
           .from("users")
@@ -322,6 +323,12 @@ serve(async (req) => {
         const price = sub.items.data[0].price as Stripe.Price;
         const cycle: DbCycle = dbCycleFromStripe(price.recurring?.interval ?? "month");
 
+        const { data: oldSub, error: oldSubErr } = await supabase
+          .from("subscriptions")
+          .select("plan_option")
+          .eq("stripe_subscription_id", sub.id)
+          .maybeSingle();
+
         const { price: catalogPrice, tokens: catalogTokens, plan_option: catalogPlanOption } = await getSubscriptionCatalog(price.id);
         const amountCents = subscriptionAmountCents(catalogPrice, price);
 
@@ -331,7 +338,7 @@ serve(async (req) => {
           .from("subscriptions")
           .update({
             plan: price.id,
-            plan_option: catalogPlanOption, // Correctly populate this column
+            plan_option: catalogPlanOption,
             billing_cycle: cycle,
             amount: catalogTokens,
             price_in_cents: amountCents,
@@ -341,6 +348,32 @@ serve(async (req) => {
           })
           .eq("stripe_subscription_id", sub.id);
         if (error) throw error;
+        
+        // Bug Fix: Credit tokens immediately on upgrade (T5)
+        if (oldSub?.plan_option && oldSub.plan_option !== catalogPlanOption) {
+          const user_id = await resolveUserId(sub);
+          const localSubId = await getLocalSubscriptionId(sub.id);
+          if (user_id && localSubId) {
+            const { data: newBatch, error: batchError } = await supabase.from("user_token_batches").insert({
+              user_id,
+              source: "subscription",
+              subscription_id: localSubId,
+              amount: catalogTokens,
+              consumed: 0,
+              is_active: true,
+              expires_at: epochToIso((sub as any).current_period_end)!,
+              note: `plan-upgrade-from-${oldSub.plan_option}-to-${catalogPlanOption}`
+            }).select("id").single();
+            if (batchError) throw batchError;
+            await supabase.from("token_event_logs").insert({
+              user_id,
+              batch_id: newBatch.id,
+              delta: catalogTokens,
+              reason: "subscription_upgrade_credit",
+            });
+            log(`subscription upgraded and tokens credited for sub=${sub.id}`);
+          }
+        }
 
         log(`subscription updated sub=${sub.id}`);
         break;
@@ -446,32 +479,12 @@ serve(async (req) => {
 
         // ---------------- Invoice-level idempotency ----------------
         const invoiceId = inv.id ?? `unknown-invoice-${event.id}`;
-        if (!(await recordEventOnce(invoiceId, "invoice.credit"))) {
-          log(`invoice ${invoiceId} already credited, skipping`);
-          break;
-        }
+        // The recordEventOnce call handles idempotency, no need for the extra `hasExistingBatch` check
+        // if (!(await recordEventOnce(invoiceId, "invoice.credit"))) {
+        //   log(`invoice ${invoiceId} already credited, skipping`);
+        //   break;
+        // }
         
-        // Check for existing token batch from `customer.subscription.created` to prevent double-granting
-        const localSub = await supabase
-          .from("subscriptions")
-          .select("id")
-          .eq("stripe_subscription_id", stripeSubId)
-          .single();
-        
-        if (localSub.error) throw localSub.error;
-
-        const hasExistingBatch = await supabase
-          .from("user_token_batches")
-          .select("id")
-          .eq("subscription_id", localSub.data.id)
-          .eq("source", "subscription")
-          .single();
-
-        if (!hasExistingBatch.error && hasExistingBatch.data) {
-          log(`Initial token batch for subscription ${localSub.data.id} already exists. Skipping grant from invoice.`);
-          break;
-        }
-
         // Link token batch to local subscription row UUID
         const localSubId = await getLocalSubscriptionId(sub.id);
 
