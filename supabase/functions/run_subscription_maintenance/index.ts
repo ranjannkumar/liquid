@@ -53,18 +53,24 @@ serve(async () => {
       for (const s of yearly) {
         const last = s.last_monthly_refill ? new Date(s.last_monthly_refill) : null;
         const already = last && last.getMonth() === thisMonth && last.getFullYear() === thisYear;
-        if (already) continue;
+        if (already) {
+          console.log(`[${EDGE_FUNCTION_NAME}] ℹ️ Subscription ${s.id} already refilled for ${thisYear}-${thisMonth + 1}.`);
+          continue;
+        }
 
         const { data: tokenRow, error: tokenError } = await supabase
           .from("subscription_prices")
           .select("tokens, monthly_refill_tokens")
           .eq("plan_option", s.plan_option)
+          .eq("plan_type", "yearly")
           .maybeSingle();
+
         if (tokenError || !tokenRow) {
           console.warn(`[${EDGE_FUNCTION_NAME}] ⚠️ Skipping refill for sub ${s.id}: token lookup failed.`);
           continue;
         }
 
+        // Fix for T11: Use monthly_refill_tokens, with fallback.
         const monthlyTokens = tokenRow.monthly_refill_tokens || Math.floor(tokenRow.tokens / 12);
         
         const expires = new Date();
@@ -72,7 +78,7 @@ serve(async () => {
 
         // Transactional logic to ensure both operations succeed or fail together
         try {
-          const { error: batchInsertError } = await supabase.from("user_token_batches").insert({
+          const { data: batchData, error: batchInsertError } = await supabase.from("user_token_batches").insert({
             user_id: s.user_id,
             source: "subscription",
             subscription_id: s.id,
@@ -81,7 +87,7 @@ serve(async () => {
             is_active: true,
             expires_at: expires.toISOString(),
             note: "yearly-monthly-refill (cron)",
-          });
+          }).select("id").single();
 
           if (batchInsertError) {
             console.error(`[${EDGE_FUNCTION_NAME}] ❌ Failed to insert token batch for sub ${s.id}:`, batchInsertError);
@@ -93,6 +99,15 @@ serve(async () => {
             console.error(`[${EDGE_FUNCTION_NAME}] ❌ Failed to update last_monthly_refill for sub ${s.id}:`, updateError);
             throw updateError;
           }
+          
+          // Log the token credit
+          await supabase.from("token_event_logs").insert({
+            user_id: s.user_id,
+            batch_id: batchData.id,
+            delta: monthlyTokens,
+            reason: "yearly_refill",
+          });
+
         } catch (e) {
             console.error(`[${EDGE_FUNCTION_NAME}] ❌ Refill process failed for subscription ${s.id}:`, e);
             // Continue to next subscription to prevent one failure from stopping the entire cron job

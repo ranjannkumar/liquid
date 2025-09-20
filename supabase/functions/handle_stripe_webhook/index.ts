@@ -106,15 +106,15 @@ async function resolveUserId(sub: Stripe.Subscription, invoice?: Stripe.Invoice)
 }
 
 /** Lookup subscription catalog row (price + tokens) by Stripe price_id */
-async function getSubscriptionCatalog(priceId: string): Promise<{ tokens: number | null; price: number | null }> {
+async function getSubscriptionCatalog(priceId: string): Promise<{ tokens: number | null; price: number | null, plan_option: string | null }> {
   const { data, error } = await supabase
     .from("subscription_prices")
-    .select("tokens, price")
+    .select("tokens, price, plan_option")
     .eq("price_id", priceId)
     .maybeSingle();
 
-  if (error || !data) return { tokens: null, price: null };
-  return { tokens: data.tokens ?? null, price: data.price ?? null }; // price in currency units
+  if (error || !data) return { tokens: null, price: null, plan_option: null };
+  return { tokens: data.tokens ?? null, price: data.price ?? null, plan_option: data.plan_option ?? null }; // price in currency units
 }
 
 /** Amount in cents from catalog (preferred) or Stripe price.unit_amount */
@@ -263,28 +263,49 @@ serve(async (req) => {
 
         const price = sub.items.data[0].price as Stripe.Price;
         const cycle: DbCycle = dbCycleFromStripe(price.recurring?.interval ?? "month");
-        const { price: catalogPrice, tokens: catalogTokens } = await getSubscriptionCatalog(price.id);
+        const { price: catalogPrice, tokens: catalogTokens, plan_option: catalogPlanOption } = await getSubscriptionCatalog(price.id);
         const amountCents = subscriptionAmountCents(catalogPrice, price);
 
-        if (catalogTokens === null) throw new Error(`Tokens not found for price_id: ${price.id}`);
+        if (catalogTokens === null || catalogPlanOption === null) throw new Error(`Tokens or plan option not found for price_id: ${price.id}`);
 
         const payload = {
-            user_id,
-            plan: price.id,
-            billing_cycle: cycle,
-            stripe_subscription_id: sub.id,
-            is_active: sub.status === "active",
-            amount: catalogTokens,         // Correctly store tokens here
-            price_in_cents: amountCents,   // Store price in the new column
-            current_period_start: epochToIso((sub as any).current_period_start),
-            current_period_end: epochToIso((sub as any).current_period_end),
-            last_monthly_refill: cycle === "yearly" ? new Date().toISOString() : null,
+          user_id,
+          plan: price.id,                             // Stripe price_id
+          plan_option: catalogPlanOption,             // Correctly populate this column
+          billing_cycle: cycle,                       // 'daily' | 'monthly' | 'yearly'
+          stripe_subscription_id: sub.id,
+          is_active: true,
+          amount: catalogTokens,                      // Store tokens granted, not price
+          price_in_cents: amountCents,                // Store price in cents
+          current_period_start: epochToIso((sub as any).current_period_start),
+          current_period_end:   epochToIso((sub as any).current_period_end),
+          last_monthly_refill:  cycle === "yearly" ? new Date().toISOString() : null,
         };
 
-        const { error } = await supabase
+        const { data: newSub, error } = await supabase
           .from("subscriptions")
-          .upsert(payload, { onConflict: "stripe_subscription_id" });
+          .upsert(payload, { onConflict: "stripe_subscription_id" })
+          .select("id").single();
         if (error) throw error;
+        
+        // Proactively insert the first token batch to prevent race condition
+        const { data: newBatch, error: batchError } = await supabase.from("user_token_batches").insert({
+          user_id,
+          source: "subscription",
+          subscription_id: newSub.id,
+          amount: catalogTokens,
+          consumed: 0,
+          is_active: true,
+          expires_at: epochToIso((sub as any).current_period_end)!,
+        }).select("id").single();
+        if (batchError) throw batchError;
+        
+        await supabase.from("token_event_logs").insert({
+          user_id,
+          batch_id: newBatch.id,
+          delta: catalogTokens,
+          reason: "subscription_initial_credit",
+        });
 
         await supabase
           .from("users")
@@ -301,18 +322,19 @@ serve(async (req) => {
         const price = sub.items.data[0].price as Stripe.Price;
         const cycle: DbCycle = dbCycleFromStripe(price.recurring?.interval ?? "month");
 
-        const { price: catalogPrice, tokens: catalogTokens } = await getSubscriptionCatalog(price.id);
+        const { price: catalogPrice, tokens: catalogTokens, plan_option: catalogPlanOption } = await getSubscriptionCatalog(price.id);
         const amountCents = subscriptionAmountCents(catalogPrice, price);
 
-        if (catalogTokens === null) throw new Error(`Tokens not found for price_id: ${price.id}`);
+        if (catalogTokens === null || catalogPlanOption === null) throw new Error(`Tokens or plan option not found for price_id: ${price.id}`);
 
         const { error } = await supabase
           .from("subscriptions")
           .update({
             plan: price.id,
+            plan_option: catalogPlanOption, // Correctly populate this column
             billing_cycle: cycle,
-            tokens: catalogTokens,
-            price: amountCents,
+            amount: catalogTokens,
+            price_in_cents: amountCents,
             current_period_start: epochToIso((sub as any).current_period_start),
             current_period_end:   epochToIso((sub as any).current_period_end),
             is_active: sub.status === "active",
@@ -327,6 +349,8 @@ serve(async (req) => {
       // ---------------- SUBSCRIPTION DELETED ---------------------
       case "customer.subscription.deleted": {
         const sub = event.data.object as Stripe.Subscription;
+        const user_id = await resolveUserId(sub);
+
         const { error } = await supabase
           .from("subscriptions")
           .update({ is_active: false })
@@ -340,6 +364,14 @@ serve(async (req) => {
             .from("user_token_batches")
             .update({ is_active: false })
             .eq("subscription_id", localId);
+        }
+
+        // Fix for T8: Update user flag on cancellation
+        if (user_id) {
+          await supabase
+            .from("users")
+            .update({ has_active_subscription: false })
+            .eq("user_id", user_id);
         }
 
         log(`subscription deleted sub=${sub.id}`);
@@ -416,6 +448,27 @@ serve(async (req) => {
         const invoiceId = inv.id ?? `unknown-invoice-${event.id}`;
         if (!(await recordEventOnce(invoiceId, "invoice.credit"))) {
           log(`invoice ${invoiceId} already credited, skipping`);
+          break;
+        }
+        
+        // Check for existing token batch from `customer.subscription.created` to prevent double-granting
+        const localSub = await supabase
+          .from("subscriptions")
+          .select("id")
+          .eq("stripe_subscription_id", stripeSubId)
+          .single();
+        
+        if (localSub.error) throw localSub.error;
+
+        const hasExistingBatch = await supabase
+          .from("user_token_batches")
+          .select("id")
+          .eq("subscription_id", localSub.data.id)
+          .eq("source", "subscription")
+          .single();
+
+        if (!hasExistingBatch.error && hasExistingBatch.data) {
+          log(`Initial token batch for subscription ${localSub.data.id} already exists. Skipping grant from invoice.`);
           break;
         }
 

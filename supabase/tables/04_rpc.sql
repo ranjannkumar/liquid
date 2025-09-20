@@ -2,7 +2,7 @@
 -- New file to add the atomic token consumption function.
 
 -- Create a function to safely consume tokens and log the event.
--- This replaces the client-side transaction logic in token_service.
+-- This replaces the flawed client-side transaction logic.
 CREATE OR REPLACE FUNCTION public.consume_tokens(
   p_user_id UUID,
   p_amount INTEGER,
@@ -20,11 +20,11 @@ DECLARE
 BEGIN
   -- Find active batches for the user, ordered by earliest expiry (FIFO).
   FOR v_batch_id, v_available IN
-    SELECT id, (amount - consumed - consumed_pending)
+    SELECT id, (amount - consumed)
     FROM public.user_token_batches
     WHERE user_id = p_user_id
       AND is_active = TRUE
-      AND (amount - consumed - consumed_pending) > 0
+      AND (amount - consumed) > 0
     ORDER BY expires_at ASC
   LOOP
     IF v_remaining <= 0 THEN
