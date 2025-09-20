@@ -65,7 +65,7 @@ serve(async (req) => {
       return new Response("Missing plan_type or plan_option", { status: 400, headers: corsHeaders });
     }
 
-    const isOneTime = plan_type === "one_time";
+    const isOneTime = plan_type === "one_time" || plan_type === "daily";
     const table = isOneTime ? "token_prices" : "subscription_prices";
 
     const { data: priceRow, error: priceErr } = await supabase
