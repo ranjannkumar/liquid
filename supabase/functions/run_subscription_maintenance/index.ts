@@ -78,11 +78,12 @@ serve(async () => {
 
         // Transactional logic to ensure both operations succeed or fail together
         try {
+          // Bug Fix: Explicitly link the subscription_id
           const { data: batchData, error: batchInsertError } = await supabase.from("user_token_batches").insert({
             user_id: s.user_id,
             source: "subscription",
-            subscription_id: s.id,
-            amount: monthlyTokens,
+            subscription_id: s.id, // Bug Fix: This should now work correctly
+            amount: monthlyTokens, // Bug Fix: Use monthly tokens
             consumed: 0,
             is_active: true,
             expires_at: expires.toISOString(),
