@@ -250,7 +250,7 @@ serve(async (req) => {
         break;
       }
 
-      // ---------------- SUBSCRIPTION CREATED (NO TOKEN GRANT HERE) ---------------------
+      // ---------------- SUBSCRIPTION CREATED ---------------------
       case "customer.subscription.created": {
         const sub = event.data.object as Stripe.Subscription;
         const user_id = await resolveUserId(sub);
@@ -376,10 +376,11 @@ serve(async (req) => {
         const localId = await getLocalSubscriptionId(sub.id);
         if (localId) {
           // Deactivate related token batches as per spec
-          await supabase
-            .from("user_token_batches")
-            .update({ is_active: false })
-            .eq("subscription_id", localId);
+          // BUG FIX: Removed this line to allow tokens to be used after immediate cancel
+          // await supabase
+          //   .from("user_token_batches")
+          //   .update({ is_active: false })
+          //   .eq("subscription_id", localId);
         }
 
         // Fix for T8: Update user flag on cancellation
@@ -469,15 +470,13 @@ serve(async (req) => {
             // This case should not happen. It suggests the subscription.created event failed.
             break;
         }
-
-        // Check for an existing batch with the same subscription_id AND amount.
-        // This is the fallback check since we don't have an invoice_id column yet.
+        
+        // BUG FIX: Use the new invoice_id column for robust idempotency on renewals (T4)
+        // Check for an existing batch with the same invoice_id
         const { data: existingBatch, error: existingBatchError } = await supabase
             .from("user_token_batches")
             .select("id")
-            .eq("subscription_id", localSubId)
-            .eq("source", "subscription")
-            .eq("amount", monthlyTokens)
+            .eq("invoice_id", inv.id)
             .maybeSingle();
 
         if (existingBatchError) {
@@ -485,7 +484,7 @@ serve(async (req) => {
             throw existingBatchError;
         }
         if (existingBatch) {
-            log(`Initial token batch for subscription ${localSubId} already exists. Skipping grant from invoice.`);
+            log(`Invoice ${inv.id} already processed for token credit. Skipping.`);
             break; // Already credited, exit.
         }
 
@@ -494,6 +493,7 @@ serve(async (req) => {
           user_id,
           source: "subscription",
           subscription_id: localSubId,
+          invoice_id: inv.id, // BUG FIX: Add the invoice ID here
           amount: monthlyTokens,
           consumed: 0,
           is_active: true,
