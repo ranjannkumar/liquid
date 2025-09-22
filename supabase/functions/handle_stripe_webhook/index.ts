@@ -444,7 +444,28 @@ serve(async (req) => {
 
         const price = sub.items.data[0].price as Stripe.Price;
         const cycle: DbCycle = dbCycleFromStripe(price.recurring?.interval ?? "month");
-        const monthlyTokens = await tokensForSubscriptionPrice(price);
+
+        // FIX: Credit correct token amount based on billing cycle
+        const { data: priceData, error: priceError } = await supabase.from("subscription_prices").select("tokens, monthly_refill_tokens").eq("price_id", price.id).maybeSingle();
+        if (priceError || !priceData) {
+          log(`Error finding price data for price ID: ${price.id}`);
+          throw new Error(`Price data not found for price_id: ${price.id}`);
+        }
+
+        let tokensToCredit = 0;
+        const isInitialCreation = inv.billing_reason === "subscription_create";
+
+        if (cycle === "yearly" && isInitialCreation) {
+          // For initial yearly subscription, credit monthly tokens
+          if (priceData.monthly_refill_tokens) {
+            tokensToCredit = priceData.monthly_refill_tokens;
+          } else {
+            tokensToCredit = Math.floor(priceData.tokens / 12);
+          }
+        } else {
+          // For all other cases (monthly, daily, renewals), credit the full amount
+          tokensToCredit = priceData.tokens;
+        }
 
         // ---------------- Period-end based expiry (production-correct) ----------------
         // Prefer the invoice line's period end (accurate for this credit).
@@ -494,7 +515,7 @@ serve(async (req) => {
           source: "subscription",
           subscription_id: localSubId,
           invoice_id: inv.id, // BUG FIX: Add the invoice ID here
-          amount: monthlyTokens,
+          amount: tokensToCredit, // Use the corrected amount
           consumed: 0,
           is_active: true,
           expires_at: expiresAtIso,
@@ -506,7 +527,7 @@ serve(async (req) => {
         await supabase.from("token_event_logs").insert({
           user_id,
           batch_id: newBatch.id,
-          delta: monthlyTokens,
+          delta: tokensToCredit,
           reason: inv.billing_reason === "subscription_create" ? "subscription_initial_credit" : "subscription_refill",
         });
 
@@ -518,7 +539,7 @@ serve(async (req) => {
         // ... (referral logic remains the same)
 
         const invoiceId = inv.id ?? `unknown-invoice-${event.id}`;
-        log(`credited ${monthlyTokens} tokens to user=${user_id} from invoice=${invoiceId}`);
+        log(`credited ${tokensToCredit} tokens to user=${user_id} from invoice=${invoiceId}`);
         break;
       }
 

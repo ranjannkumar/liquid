@@ -1,5 +1,4 @@
-// supabase/_tests_/cronjobs.test.ts
-
+// deno test -A tests/cronjobs.test.ts
 import { assertEquals } from "https://deno.land/std/testing/asserts.ts";
 import sinon from "npm:sinon";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
@@ -16,10 +15,12 @@ const mockRefillLogic = async () => {
     { id: "sub2", user_id: "user2", plan: "price_yearly_premium", last_monthly_refill: new Date(thisYear, thisMonth, 1).toISOString() },
   ];
 
-  // Correct the object literal to only include 'data'
   const { data: yearly } = { data: mockYearlySubs };
   const insertStub = sinon.stub();
-  const updateStub = sinon.stub();
+  
+  // Correctly stub the chained methods
+  const eqStub = sinon.stub().returns({ data: null, error: null });
+  const updateStub = sinon.stub().returns({ eq: eqStub });
 
   const oldStub = sinon.stub(supabase, "from").returns({
       select: () => ({
@@ -28,7 +29,7 @@ const mockRefillLogic = async () => {
           }),
       }),
       insert: insertStub.returns({ data: [], error: null }),
-      update: updateStub.returns({ eq: () => ({ data: null, error: null }) }),
+      update: updateStub, // Use the new stub here
   });
 
   for (const s of yearly ?? []) {
@@ -36,7 +37,7 @@ const mockRefillLogic = async () => {
     const already = last && last.getMonth() === thisMonth && last.getFullYear() === thisYear;
     if (already) continue;
 
-    const { data: tokenRow } = { data: { tokens: 1000 } }; // Correct the object literal
+    const { data: tokenRow } = { data: { tokens: 1000 } };
     if (!tokenRow) continue;
 
     const expires = new Date();
@@ -56,8 +57,11 @@ const mockRefillLogic = async () => {
   
   assertEquals(insertStub.callCount, 1);
   assertEquals(updateStub.callCount, 1);
+  
+  // Correct assertions to check the arguments on the correct stubs
   assertEquals(insertStub.getCall(0).args[0].user_id, "user1");
-  assertEquals(updateStub.getCall(0).args[1].id, "sub1");
+  assertEquals(updateStub.getCall(0).args[0].last_monthly_refill, now.toISOString());
+  assertEquals(eqStub.getCall(0).args[1], "sub1");
   
   oldStub.restore();
 };
