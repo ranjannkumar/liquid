@@ -152,6 +152,84 @@ type InvoiceWithSub = Stripe.Invoice & {
   subscription?: string | Stripe.Subscription | null;
 };
 
+// ================ HELPER FUNCTIONS =================
+async function handleReferralReward(referred_user_id: string) {
+  if (REFERRAL_TOKEN_AMOUNT <= 0) {
+    log(`Referral token amount is not set or is zero. Skipping referral reward for ${referred_user_id}.`);
+    return;
+  }
+  
+  const { data: referralData, error: referralError } = await supabase
+    .from("referrals")
+    .select("id, referrer_user_id")
+    .eq("referred_user_id", referred_user_id)
+    .eq("is_rewarded", false)
+    .maybeSingle();
+
+  if (referralError) {
+    log(`Error fetching referral data for ${referred_user_id}: ${stringifyErr(referralError)}`);
+    return;
+  }
+
+  if (referralData) {
+    const { id: referral_id, referrer_user_id } = referralData;
+    log(`Referral conversion detected: referred_user_id=${referred_user_id}, referrer_user_id=${referrer_user_id}`);
+    
+    // Check for a duplicate reward
+    const { data: existingReward, error: existingRewardError } = await supabase
+      .from("user_token_batches")
+      .select("id")
+      .eq("source", "referral")
+      .eq("user_id", referrer_user_id)
+      .maybeSingle();
+
+    if (existingReward) {
+      log(`Referral reward already granted to ${referrer_user_id}. Skipping.`);
+      return;
+    }
+    
+    const expiresAt = new Date();
+    expiresAt.setDate(expiresAt.getDate() + 365); // Expire in one year
+    
+    // Grant the token batch
+    const { data: newBatch, error: batchError } = await supabase.from("user_token_batches").insert({
+      user_id: referrer_user_id,
+      source: "referral",
+      amount: REFERRAL_TOKEN_AMOUNT,
+      consumed: 0,
+      is_active: true,
+      expires_at: expiresAt.toISOString(),
+      note: `Referral: ${referred_user_id}`,
+    }).select("id").single();
+    
+    if (batchError) {
+      log(`Error inserting referral token batch: ${stringifyErr(batchError)}`);
+      throw batchError;
+    }
+
+    // Update the referral record to prevent double-granting
+    const { error: updateError } = await supabase
+      .from("referrals")
+      .update({ is_rewarded: true })
+      .eq("id", referral_id);
+    
+    if (updateError) {
+      log(`Error updating referral record: ${stringifyErr(updateError)}`);
+      throw updateError;
+    }
+    
+    // Log the token credit
+    await supabase.from("token_event_logs").insert({
+      user_id: referrer_user_id,
+      batch_id: newBatch.id,
+      delta: REFERRAL_TOKEN_AMOUNT,
+      reason: "referral_reward",
+    });
+    
+    log(`Successfully granted ${REFERRAL_TOKEN_AMOUNT} tokens to referrer ${referrer_user_id}`);
+  }
+}
+
 // ================ SERVER =================
  serve(async (req) => {
   const sig = req.headers.get("stripe-signature");
@@ -246,6 +324,9 @@ type InvoiceWithSub = Stripe.Invoice & {
           reason: "purchase",
         });
 
+        // --- REFERRAL LOGIC ---
+        await handleReferralReward(user_id);
+        
         log(`one-time purchase recorded for user=${user_id} purchase_id=${session.id}`);
         break;
       }
@@ -373,17 +454,7 @@ type InvoiceWithSub = Stripe.Invoice & {
           .eq("stripe_subscription_id", sub.id);
         if (error) throw error;
 
-        const localId = await getLocalSubscriptionId(sub.id);
-        if (localId) {
-          // Deactivate related token batches as per spec
-          // BUG FIX: Removed this line to allow tokens to be used after immediate cancel
-          // await supabase
-          //   .from("user_token_batches")
-          //   .update({ is_active: false })
-          //   .eq("subscription_id", localId);
-        }
-
-        // Fix for T8: Update user flag on cancellation
+        // The user can still spend remaining tokens, so we don't deactivate batches here.
         if (user_id) {
           await supabase
             .from("users")
@@ -544,7 +615,11 @@ type InvoiceWithSub = Stripe.Invoice & {
           .update({ has_active_subscription: true, has_payment_issue: false })
           .eq("user_id", user_id);
 
-        // ... (referral logic remains the same)
+        // --- REFERRAL LOGIC ---
+        // This logic is for a new user's first subscription payment.
+        if (isInitialCreation) {
+          await handleReferralReward(user_id);
+        }
 
         const invoiceId = inv.id ?? `unknown-invoice-${event.id}`;
         log(`credited ${tokensToCredit} tokens to user=${user_id} from invoice=${invoiceId}`);
