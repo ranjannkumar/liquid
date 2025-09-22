@@ -313,6 +313,7 @@ async function handleReferralReward(referred_user_id: string) {
           consumed: 0,
           is_active: true,
           expires_at: expiresAt.toISOString(),
+          note: "one-time-purchase"
         });
         if (berr) throw berr;
         
@@ -598,6 +599,7 @@ async function handleReferralReward(referred_user_id: string) {
           consumed: 0,
           is_active: true,
           expires_at: expiresAtIso,
+          note: `Subscription: ${sub.id}`
         }).select("id").single();
         
         if (batchError) throw batchError;
