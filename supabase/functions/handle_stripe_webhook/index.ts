@@ -153,7 +153,7 @@ type InvoiceWithSub = Stripe.Invoice & {
 };
 
 // ================ SERVER =================
-serve(async (req) => {
+ serve(async (req) => {
   const sig = req.headers.get("stripe-signature");
   const raw = await req.text();
 
@@ -444,28 +444,36 @@ serve(async (req) => {
 
         const price = sub.items.data[0].price as Stripe.Price;
         const cycle: DbCycle = dbCycleFromStripe(price.recurring?.interval ?? "month");
+        
+        // FIX: Credit correct token amount based on billing reason and cycle
+        const { data: priceData, error: priceError } = await supabase
+          .from("subscription_prices")
+          .select("tokens, monthly_refill_tokens")
+          .eq("price_id", price.id)
+          .maybeSingle();
 
-        // FIX: Credit correct token amount based on billing cycle
-        const { data: priceData, error: priceError } = await supabase.from("subscription_prices").select("tokens, monthly_refill_tokens").eq("price_id", price.id).maybeSingle();
         if (priceError || !priceData) {
           log(`Error finding price data for price ID: ${price.id}`);
           throw new Error(`Price data not found for price_id: ${price.id}`);
         }
-
+        
         let tokensToCredit = 0;
         const isInitialCreation = inv.billing_reason === "subscription_create";
 
-        if (cycle === "yearly" && isInitialCreation) {
-          // For initial yearly subscription, credit monthly tokens
-          if (priceData.monthly_refill_tokens) {
-            tokensToCredit = priceData.monthly_refill_tokens;
-          } else {
-            tokensToCredit = Math.floor(priceData.tokens / 12);
-          }
+        if (isInitialCreation) {
+            if (cycle === "yearly" && priceData.monthly_refill_tokens) {
+                // For initial yearly subscription, credit monthly tokens and update last_monthly_refill
+                tokensToCredit = priceData.monthly_refill_tokens;
+                await supabase.from("subscriptions").update({ last_monthly_refill: new Date().toISOString() }).eq("stripe_subscription_id", sub.id);
+            } else {
+                // For initial monthly/daily subscription, credit full amount
+                tokensToCredit = priceData.tokens;
+            }
         } else {
-          // For all other cases (monthly, daily, renewals), credit the full amount
-          tokensToCredit = priceData.tokens;
+            // For renewals, credit full amount (yearly renewals are handled by cron)
+            tokensToCredit = priceData.tokens;
         }
+
 
         // ---------------- Period-end based expiry (production-correct) ----------------
         // Prefer the invoice line's period end (accurate for this credit).

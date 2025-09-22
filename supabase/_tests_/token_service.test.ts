@@ -7,9 +7,9 @@ import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 const supabase = createClient("http://localhost:54321", "fake-key");
 
 const mockBatches = [
-  { id: "batch-1", available: 10, consumed: 0, expires_at: new Date(Date.now() + 1000).toISOString() },
-  { id: "batch-2", available: 50, consumed: 0, expires_at: new Date(Date.now() + 5000).toISOString() },
-  { id: "batch-3", available: 30, consumed: 0, expires_at: new Date(Date.now() + 2000).toISOString() },
+  { id: "batch-1", amount: 10, consumed: 0, expires_at: new Date(Date.now() + 1000).toISOString() },
+  { id: "batch-2", amount: 50, consumed: 0, expires_at: new Date(Date.now() + 5000).toISOString() },
+  { id: "batch-3", amount: 30, consumed: 0, expires_at: new Date(Date.now() + 2000).toISOString() },
 ];
 
 const mockConsumeTokens = async (user_id: string, amount: number, reason: string): Promise<number> => {
@@ -44,23 +44,30 @@ const mockConsumeTokens = async (user_id: string, amount: number, reason: string
 
 Deno.test("FIFO across batches prefers earliest expiry", async () => {
   const fromStub = sinon.stub(supabase, "from");
-  const selectStub = sinon.stub();
   const updateStub = sinon.stub();
   const insertStub = sinon.stub();
+  
+  // Sort the mock batches correctly by expiry date
+  const sortedBatches = [
+    mockBatches[0], // batch-1 (expires in 1s)
+    mockBatches[2], // batch-3 (expires in 2s)
+    mockBatches[1], // batch-2 (expires in 5s)
+  ];
+
+  // Correctly mock the chained calls
+  const eqStub = sinon.stub().returns({ data: null, error: null });
+  updateStub.returns({ eq: eqStub });
+
   fromStub.withArgs("user_token_batches").returns({
-    select: () => ({
-      eq: () => ({
-        eq: () => ({
-          gt: () => ({
-            order: () => ({
-              data: mockBatches,
-              error: null,
-            }),
-          }),
+    select: sinon.stub().returns({
+      eq: sinon.stub().returns({
+        order: sinon.stub().returns({
+          data: sortedBatches,
+          error: null,
         }),
       }),
     }),
-    update: updateStub.returns({ eq: () => ({ data: null, error: null }) }),
+    update: updateStub,
   });
 
   fromStub.withArgs("token_event_logs").returns({
@@ -73,13 +80,13 @@ Deno.test("FIFO across batches prefers earliest expiry", async () => {
   assertEquals(updateStub.callCount, 2);
   assertEquals(insertStub.callCount, 2);
 
-  // First batch update (batch-1)
+  // Assertions for the first batch update (batch-1)
   assertEquals(updateStub.getCall(0).args[0].consumed, 10);
-  assertEquals(updateStub.getCall(0).args[1].id, "batch-1");
+  assertEquals(eqStub.getCall(0).args[1], "batch-1");
 
-  // Second batch update (batch-3)
+  // Assertions for the second batch update (batch-3)
   assertEquals(updateStub.getCall(1).args[0].consumed, 30);
-  assertEquals(updateStub.getCall(1).args[1].id, "batch-3");
+  assertEquals(eqStub.getCall(1).args[1], "batch-3");
   
   fromStub.restore();
 });
