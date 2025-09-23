@@ -132,7 +132,7 @@ async function tokensForSubscriptionPrice(price: Stripe.Price): Promise<number> 
     .eq("price_id", price.id)
     .maybeSingle();
 
-  if (error || !data) throw new Error(`No tokens in subscription_prices for price_id=${price.id}`);
+  if (error || !data) throw new Error(`No tokens in subscription_prices for price_id: ${price.id}`);
   return data.tokens;
 }
 
@@ -369,9 +369,6 @@ async function handleReferralReward(referred_user_id: string) {
           .select("id").single();
         if (error) throw error;
         
-        // This block for token granting is intentionally commented out to prevent T3 double-granting.
-        // Tokens for initial subscriptions are granted ONLY on invoice.paid.
-
         await supabase
           .from("users")
           .update({ has_active_subscription: true, has_payment_issue: false })
@@ -392,12 +389,13 @@ async function handleReferralReward(referred_user_id: string) {
           .select("plan_option")
           .eq("stripe_subscription_id", sub.id)
           .maybeSingle();
+        if (oldSubErr) throw oldSubErr;
 
         const { price: catalogPrice, tokens: catalogTokens, plan_option: catalogPlanOption } = await getSubscriptionCatalog(price.id);
         const amountCents = subscriptionAmountCents(catalogPrice, price);
 
         if (catalogTokens === null || catalogPlanOption === null) throw new Error(`Tokens or plan option not found for price_id: ${price.id}`);
-
+        
         const { error } = await supabase
           .from("subscriptions")
           .update({
@@ -413,7 +411,7 @@ async function handleReferralReward(referred_user_id: string) {
           .eq("stripe_subscription_id", sub.id);
         if (error) throw error;
         
-        // Bug Fix: Credit tokens immediately on upgrade (T5)
+        // Fix: Credit tokens immediately on upgrade (T5)
         if (oldSub?.plan_option && oldSub.plan_option !== catalogPlanOption) {
           const user_id = await resolveUserId(sub);
           const localSubId = await getLocalSubscriptionId(sub.id);
@@ -475,10 +473,17 @@ async function handleReferralReward(referred_user_id: string) {
           break;
         }
 
-        // Do not credit tokens for upgrades here. T5 is handled by customer.subscription.updated.
-        if (invBase.billing_reason === 'subscription_update') {
+        // Fix: Skip token credit for upgrades handled by customer.subscription.updated (T5)
+        if (invBase.billing_reason === 'subscription_cycle') {
+          // This is a renewal, which should be handled here.
+        } else if (invBase.billing_reason === 'subscription_create') {
+          // This is an initial subscription. Proceed with the credit.
+        } else if (invBase.billing_reason === 'subscription_update') {
           log(`skip invoice ${invBase.id}: upgrade already handled by subscription.updated`);
           break;
+        } else {
+            log(`invoice ${invBase.id} has unknown billing reason: ${invBase.billing_reason}, ignoring.`);
+            break;
         }
 
         const inv = invBase as InvoiceWithSub;
@@ -538,20 +543,18 @@ async function handleReferralReward(referred_user_id: string) {
         const isInitialCreation = inv.billing_reason === "subscription_create";
 
         if (isInitialCreation) {
+            // FIX: Credit only the first monthly amount for a new yearly subscription
             if (cycle === "yearly" && priceData.monthly_refill_tokens) {
-                // For initial yearly subscription, credit monthly tokens and update last_monthly_refill
                 tokensToCredit = priceData.monthly_refill_tokens;
                 await supabase.from("subscriptions").update({ last_monthly_refill: new Date().toISOString() }).eq("stripe_subscription_id", sub.id);
             } else {
-                // For initial monthly/daily subscription, credit full amount
                 tokensToCredit = priceData.tokens;
             }
         } else {
-            // For renewals, credit full amount (yearly renewals are handled by cron)
+            // For renewals, credit full amount
             tokensToCredit = priceData.tokens;
         }
-
-
+        
         // ---------------- Period-end based expiry (production-correct) ----------------
         // Prefer the invoice line's period end (accurate for this credit).
         const recurringLine =
@@ -568,17 +571,14 @@ async function handleReferralReward(referred_user_id: string) {
           addExpiry(new Date(), cycle).toISOString();
 
         // ---------------- Idempotency for this specific token credit ----------------
-        // IMPORTANT FIX: Check if a token batch for THIS INVOICE has already been credited.
         const localSubId = await getLocalSubscriptionId(sub.id);
 
         if (!localSubId) {
             log(`invoice ${inv.id}: local subscription row not found for stripe sub ${sub.id}`);
-            // This case should not happen. It suggests the subscription.created event failed.
             break;
         }
         
         // BUG FIX: Use the new invoice_id column for robust idempotency on renewals (T4)
-        // Check for an existing batch with the same invoice_id
         const { data: existingBatch, error: existingBatchError } = await supabase
             .from("user_token_batches")
             .select("id")
@@ -591,16 +591,15 @@ async function handleReferralReward(referred_user_id: string) {
         }
         if (existingBatch) {
             log(`Invoice ${inv.id} already processed for token credit. Skipping.`);
-            break; // Already credited, exit.
+            break;
         }
 
-        // If no existing batch, proceed to insert.
         const { data: newBatch, error: batchError } = await supabase.from("user_token_batches").insert({
           user_id,
           source: "subscription",
           subscription_id: localSubId,
           invoice_id: inv.id, // BUG FIX: Add the invoice ID here
-          amount: tokensToCredit, // Use the corrected amount
+          amount: tokensToCredit,
           consumed: 0,
           is_active: true,
           expires_at: expiresAtIso,
@@ -609,7 +608,6 @@ async function handleReferralReward(referred_user_id: string) {
         
         if (batchError) throw batchError;
 
-        // Log the token credit
         await supabase.from("token_event_logs").insert({
           user_id,
           batch_id: newBatch.id,
@@ -622,8 +620,6 @@ async function handleReferralReward(referred_user_id: string) {
           .update({ has_active_subscription: true, has_payment_issue: false })
           .eq("user_id", user_id);
 
-        // --- REFERRAL LOGIC ---
-        // This logic is for a new user's first subscription payment.
         if (isInitialCreation) {
           await handleReferralReward(user_id);
         }
