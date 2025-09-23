@@ -1,4 +1,3 @@
-// supabase/functions/handle_stripe_webhook/index.ts
 import { serve } from "https://deno.land/std/http/server.ts";
 import Stripe from "npm:stripe";
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
@@ -476,6 +475,12 @@ async function handleReferralReward(referred_user_id: string) {
           break;
         }
 
+        // Do not credit tokens for upgrades here. T5 is handled by customer.subscription.updated.
+        if (invBase.billing_reason === 'subscription_update') {
+          log(`skip invoice ${invBase.id}: upgrade already handled by subscription.updated`);
+          break;
+        }
+
         const inv = invBase as InvoiceWithSub;
 
         // Best source of truth: invoice.subscription
@@ -550,7 +555,7 @@ async function handleReferralReward(referred_user_id: string) {
         // ---------------- Period-end based expiry (production-correct) ----------------
         // Prefer the invoice line's period end (accurate for this credit).
         const recurringLine =
-          inv.lines?.data?.find((l: any) => l.price?.type === "recurring" || l.subscription) ??
+          inv.lines?.data?.find((l) => (l as any).price?.type === "recurring" || l.subscription) ??
           inv.lines?.data?.[0];
         const linePeriodEndSec: number | undefined = (recurringLine as any)?.period?.end;
 
@@ -625,6 +630,74 @@ async function handleReferralReward(referred_user_id: string) {
 
         const invoiceId = inv.id ?? `unknown-invoice-${event.id}`;
         log(`credited ${tokensToCredit} tokens to user=${user_id} from invoice=${invoiceId}`);
+        break;
+      }
+
+      // -------------- PAYMENT INTENT SUCCEEDED -----------
+      case "payment_intent.succeeded": {
+        const intent = event.data.object as Stripe.PaymentIntent;
+
+        const purchaseId = intent.id;
+        const meta = (intent.metadata ?? {}) as Record<string, string>;
+        const user_id = meta.user_id;
+        const plan_option = meta.plan_option;
+
+        if (!user_id || !plan_option) {
+          log("payment_intent.succeeded missing user_id or plan_option in metadata. Skipping.");
+          break;
+        }
+
+        // Idempotency check: see if a purchase batch for this intent already exists
+        const { data: existingPurchase, error: existingPurchaseError } = await supabase
+          .from("user_token_purchases")
+          .select("id")
+          .eq("stripe_purchase_id", purchaseId)
+          .maybeSingle();
+
+        if (existingPurchaseError) throw existingPurchaseError;
+        if (existingPurchase) {
+          log(`duplicate payment_intent.succeeded for purchase ID ${purchaseId}, skipping`);
+          break;
+        }
+
+        const { data: tier, error: tErr } = await supabase
+          .from("token_prices")
+          .select("tokens")
+          .eq("plan_option", plan_option)
+          .maybeSingle();
+        if (tErr || !tier) throw new Error(`token_prices not found for ${plan_option}`);
+
+        const now = new Date();
+        const expiresAt = new Date(now);
+        expiresAt.setDate(expiresAt.getDate() + 60);
+
+        const { data: purchase, error: perr } = await supabase
+          .from("user_token_purchases")
+          .insert({
+            user_id,
+            plan: plan_option,
+            stripe_purchase_id: purchaseId,
+            amount: tier.tokens,
+            current_period_start: now.toISOString(),
+            current_period_end: expiresAt.toISOString(),
+          })
+          .select("id")
+          .single();
+        if (perr) throw perr;
+
+        const { error: berr } = await supabase.from("user_token_batches").insert({
+          user_id,
+          source: "purchase",
+          purchase_id: purchase.id,
+          amount: tier.tokens,
+          consumed: 0,
+          is_active: true,
+          expires_at: expiresAt.toISOString(),
+          note: "one-time-purchase-payment-intent",
+        });
+        if (berr) throw berr;
+
+        log(`one-time purchase recorded via payment_intent for user=${user_id} purchase_id=${purchaseId}`);
         break;
       }
 
