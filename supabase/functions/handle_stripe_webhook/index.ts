@@ -104,6 +104,262 @@ async function resolveUserId(sub: Stripe.Subscription, invoice?: Stripe.Invoice)
   return null;
 }
 
+// ---- Failure reason extraction (robust) ----
+// Stripe's Invoice typings in Deno may omit `.charge`. Widen locally.
+// --- Local type wideners for gaps in Stripe's Deno typings ---
+// --- Local wideners for gaps in Stripe's Deno typings ---
+type InvoiceWide = Stripe.Invoice & {
+  payment_intent?: string | Stripe.PaymentIntent | null;
+  charge?: string | Stripe.Charge | null;
+  subscription?: string | Stripe.Subscription | null;
+};
+
+// PaymentIntent sometimes carries .invoice in the API payload
+type PaymentIntentWide = Stripe.PaymentIntent & {
+  invoice?: string | Stripe.Invoice | null;
+};
+
+// Charge sometimes carries .invoice in the API payload
+type ChargeWide = Stripe.Charge & {
+  invoice?: string | Stripe.Invoice | null;
+};
+
+
+
+
+async function extractFailureReasonFromInvoice(
+  stripe: Stripe,
+  inv: Stripe.Invoice
+): Promise<string> {
+  // 0) Re-fetch the invoice with expansions — event payloads can be thin
+  let freshInv: InvoiceWide = inv as any;
+try {
+  const invId = (inv as any).id as string | undefined;
+  if (invId) {
+    freshInv = (await stripe.invoices.retrieve(invId, {
+      expand: ["payment_intent", "payment_intent.latest_charge"],
+    })) as any as InvoiceWide;
+  }
+} catch {
+  // proceed with whatever we have
+}
+
+
+  // --- Helper to format messages from a Charge ---
+  const fromCharge = (ch: Stripe.Charge) => {
+    const parts: string[] = [];
+    if (ch.failure_code) parts.push(`failure_code=${ch.failure_code}`);
+    if (ch.outcome?.reason) parts.push(`outcome_reason=${ch.outcome.reason}`);
+    if (ch.outcome?.seller_message) parts.push(`seller_message=${ch.outcome.seller_message}`);
+    if (ch.failure_message) parts.push(`failure_message=${ch.failure_message}`);
+    return parts.length ? `charge: ${parts.join(", ")}` : "";
+  };
+
+  // --- 1) Prefer PaymentIntent → last_payment_error / latest_charge (from fresh invoice) ---
+  try {
+    const piId =
+      typeof freshInv.payment_intent === "string"
+        ? freshInv.payment_intent
+        : freshInv.payment_intent?.id;
+
+    if (piId) {
+      const pi = await stripe.paymentIntents.retrieve(piId, { expand: ["latest_charge"] });
+      const lpe = pi.last_payment_error;
+      if (lpe?.message || lpe?.code || lpe?.decline_code) {
+        const parts: string[] = [];
+        if (lpe.code) parts.push(`code=${lpe.code}`);
+        if (lpe.decline_code) parts.push(`decline_code=${lpe.decline_code}`);
+        if (lpe.message) parts.push(`message=${lpe.message}`);
+        return `payment_intent: ${parts.join(", ")}`;
+      }
+      const lc = pi.latest_charge as Stripe.Charge | null;
+      if (lc) {
+        const msg = fromCharge(lc);
+        if (msg) return msg;
+      }
+    }
+  } catch {
+    // continue to other sources
+  }
+
+  // --- 2) Try invoice.charge directly (present on some invoices) ---
+  // 2) Try invoice.charge
+try {
+  const chargeIdStr =
+    typeof freshInv.charge === "string"
+      ? freshInv.charge
+      : freshInv.charge?.id; // <- coerce object to id if present
+
+  if (chargeIdStr) {
+    const ch = await stripe.charges.retrieve(chargeIdStr);
+    const msg = fromCharge(ch);
+    if (msg) return msg;
+  }
+} catch {
+  // continue
+}
+
+
+  // --- 3) NEW: Search PaymentIntents by invoice id (list doesn't support invoice filter) ---
+  try {
+    const invId = (inv as any).id as string | undefined;
+    if (invId && (stripe.paymentIntents as any).search) {
+      const searchRes = await (stripe.paymentIntents as any).search({
+        query: `invoice:"${invId}"`,
+        limit: 1,
+      });
+      const pi = searchRes?.data?.[0] as Stripe.PaymentIntent | undefined;
+      if (pi) {
+        const lpe = pi.last_payment_error;
+        if (lpe?.message || lpe?.code || lpe?.decline_code) {
+          const parts: string[] = [];
+          if (lpe.code) parts.push(`code=${lpe.code}`);
+          if (lpe.decline_code) parts.push(`decline_code=${lpe.decline_code}`);
+          if (lpe.message) parts.push(`message=${lpe.message}`);
+          return `payment_intent: ${parts.join(", ")}`;
+        }
+        // expand latest_charge if needed
+        const piFull = await stripe.paymentIntents.retrieve(pi.id, { expand: ["latest_charge"] });
+        const lc = piFull.latest_charge as Stripe.Charge | null;
+        if (lc) {
+          const msg = fromCharge(lc);
+          if (msg) return msg;
+        }
+      }
+    }
+  } catch {
+    // continue
+  }
+
+  // --- 4) NEW: If subscription exists, fetch and expand latest_invoice.payment_intent.latest_charge ---
+  // 4) If subscription exists, fetch and expand latest_invoice.payment_intent.latest_charge
+try {
+  const subId =
+    typeof freshInv.subscription === "string"
+      ? freshInv.subscription
+      : freshInv.subscription?.id;
+
+  if (subId) {
+    const sub = await stripe.subscriptions.retrieve(subId, {
+      expand: [
+        "latest_invoice.payment_intent",
+        "latest_invoice.payment_intent.latest_charge",
+      ],
+    });
+
+    const latest = sub.latest_invoice as (InvoiceWide | null) | undefined;
+    const pi =
+      latest &&
+      (typeof latest.payment_intent === "object"
+        ? (latest.payment_intent as Stripe.PaymentIntent)
+        : undefined);
+
+    if (pi) {
+      const lpe = pi.last_payment_error;
+      if (lpe?.message || lpe?.code || lpe?.decline_code) {
+        const parts: string[] = [];
+        if (lpe.code) parts.push(`code=${lpe.code}`);
+        if (lpe.decline_code) parts.push(`decline_code=${lpe.decline_code}`);
+        if (lpe.message) parts.push(`message=${lpe.message}`);
+        return `payment_intent: ${parts.join(", ")}`;
+      }
+      const lc = pi.latest_charge as Stripe.Charge | null;
+      if (lc) {
+        const msg = fromCharge(lc);
+        if (msg) return msg;
+      }
+    }
+  }
+} catch {
+  // continue
+}
+
+  // --- NEW: Diagnose *why* no attempt happened so we can store a useful reason ---
+  try {
+    // 1) Collection method check (manual invoices never auto-pay)
+    if (freshInv.collection_method === "send_invoice") {
+      return `no_automatic_payment: collection_method=send_invoice`;
+    }
+
+    // 2) For charge_automatically, see if customer lacks a default PM
+    const custId =
+      typeof freshInv.customer === "string"
+        ? freshInv.customer
+        : (freshInv.customer as Stripe.Customer | null)?.id;
+
+    if (custId) {
+      const cust = (await stripe.customers.retrieve(custId)) as Stripe.Customer;
+      const hasDefaultPM =
+        !!cust.invoice_settings?.default_payment_method ||
+        !!(cust as any).default_source; // legacy sources
+
+      if (!hasDefaultPM) {
+        return `no_payment_method_on_file: customer has no default payment method`;
+      }
+    }
+
+    // 3) If we got here, invoice is charge_automatically but still no PI/Charge visible.
+    // This is usually an ordering/race in test flows; tell the truth:
+    return `no_attempt_yet: invoice open with no payment_intent or charge`;
+  } catch {
+    // fall through to the generic "unknown" wording below if any lookup failed
+  }
+
+
+  // --- 5) Final fallback — still write something useful, never leave NULL on real failures ---
+  const attemptCount = (inv.attempt_count ?? 0).toString();
+  const nextAttempt = inv.next_payment_attempt
+    ? new Date(inv.next_payment_attempt * 1000).toISOString()
+    : "n/a";
+  return `unknown: status=${inv.status}, attempt_count=${attemptCount}, next_attempt=${nextAttempt}`;
+}
+
+function formatReasonFromPI(pi: Stripe.PaymentIntent): string | null {
+  const lpe = pi.last_payment_error;
+  if (lpe?.message || lpe?.code || lpe?.decline_code) {
+    const parts: string[] = [];
+    if (lpe.code) parts.push(`code=${lpe.code}`);
+    if (lpe.decline_code) parts.push(`decline_code=${lpe.decline_code}`);
+    if (lpe.message) parts.push(`message=${lpe.message}`);
+    return `payment_intent: ${parts.join(", ")}`;
+  }
+  const lc = pi.latest_charge as Stripe.Charge | null;
+  if (lc && (lc.failure_message || lc.outcome?.reason || lc.outcome?.seller_message)) {
+    const parts: string[] = [];
+    if (lc.failure_code) parts.push(`failure_code=${lc.failure_code}`);
+    if (lc.outcome?.reason) parts.push(`outcome_reason=${lc.outcome.reason}`);
+    if (lc.outcome?.seller_message) parts.push(`seller_message=${lc.outcome.seller_message}`);
+    if (lc.failure_message) parts.push(`failure_message=${lc.failure_message}`);
+    return `charge: ${parts.join(", ")}`;
+  }
+  return null;
+}
+
+async function writeFailureToDb(
+  supabase: any,
+  user_id: string,
+  localSubId: string,
+  reason: string
+) {
+  // update subscriptions row
+  const { error: subUpdateError } = await supabase
+    .from("subscriptions")
+    .update({ is_active: false, payment_failure_reason: reason })
+    .eq("id", localSubId);
+  if (subUpdateError) throw subUpdateError;
+
+  // flip user flags (non-blocking if you prefer)
+  await supabase
+    .from("users")
+    .update({ has_active_subscription: false, has_payment_issue: true })
+    .eq("user_id", user_id);
+}
+
+
+
+
+
+
 /** Lookup subscription catalog row (price + tokens) by Stripe price_id */
 async function getSubscriptionCatalog(priceId: string): Promise<{ tokens: number | null; price: number | null, plan_option: string | null }> {
   const { data, error } = await supabase
@@ -361,6 +617,7 @@ async function handleReferralReward(referred_user_id: string) {
           current_period_start: epochToIso((sub as any).current_period_start),
           current_period_end:   epochToIso((sub as any).current_period_end),
           last_monthly_refill: null, // Reset for new subscriptions, let cron handle it.
+          payment_failure_reason: null, // Initialize failure reason as null
         };
 
         const { data: newSub, error } = await supabase
@@ -464,6 +721,187 @@ async function handleReferralReward(referred_user_id: string) {
         break;
       }
 
+      // ---------------- PAYMENT FAILED ---------------------
+      // ---------------- PAYMENT FAILED ---------------------
+case "invoice.payment_failed": {
+  const invBase = event.data.object as Stripe.Invoice;
+  const inv = invBase as InvoiceWithSub;
+
+  // --- Resolve the related Stripe Subscription ID (unchanged logic + small hardening) ---
+  let stripeSubId: string | null =
+    typeof inv.subscription === "string" ? inv.subscription : null;
+
+  if (!stripeSubId && inv.lines?.data?.length) {
+    const lineWithSub = inv.lines.data.find((l) => typeof (l as any).subscription === "string");
+    stripeSubId = (lineWithSub?.subscription as string) ?? null;
+  }
+
+  if (!stripeSubId && typeof inv.customer === "string") {
+    try {
+      const subs = await stripe.subscriptions.list({
+        customer: inv.customer,
+        status: "all", // include past_due/unpaid/canceled to not miss it
+        limit: 1,
+      });
+      stripeSubId = subs.data[0]?.id ?? null;
+    } catch (_e) {
+      // ignore; we'll bail out below if still null
+    }
+  }
+
+  if (!stripeSubId) {
+    log(`invoice.payment_failed ${inv.id}: failed to resolve subscription ID, ignoring.`);
+    break;
+  }
+
+  // --- Extract a robust failure reason (NEW) ---
+  const failureReason = await extractFailureReasonFromInvoice(stripe, invBase);
+
+  // --- Find local subscription row ---
+  const { data: localSub, error: findErr } = await supabase
+    .from("subscriptions")
+    .select("id, user_id")
+    .eq("stripe_subscription_id", stripeSubId)
+    .maybeSingle();
+  if (findErr) throw findErr;
+
+  const user_id = localSub?.user_id;
+  if (!localSub || !user_id) {
+    log(`invoice ${inv.id}: local subscription row not found for stripe_subscription_id=${stripeSubId}`);
+    break;
+  }
+
+  // --- Update local subscription flags + failure reason ---
+  const { error: subUpdateError } = await supabase
+    .from("subscriptions")
+    .update({
+      is_active: false,
+      payment_failure_reason: failureReason, // <-- key write
+    })
+    .eq("id", localSub.id);
+  if (subUpdateError) throw subUpdateError;
+
+  // --- Mark user flags so you can trigger emails elsewhere (unchanged) ---
+  await supabase
+    .from("users")
+    .update({ has_active_subscription: false, has_payment_issue: true })
+    .eq("user_id", user_id);
+
+  log(
+    `payment failed for user=${user_id} sub=${stripeSubId}. Reason: ${failureReason}`
+  );
+
+  // If you want to enqueue an email, uncomment and point to your queue/table:
+  // await supabase.from("email_queue").insert({
+  //   user_id,
+  //   template: "payment_failed",
+  //   payload: { subscription_id: stripeSubId, reason: failureReason, invoice_id: inv.id },
+  // });
+
+  break;
+}
+
+case "payment_intent.payment_failed": {
+  const piRaw = event.data.object as Stripe.PaymentIntent;
+  const pi = piRaw as PaymentIntentWide;
+
+  // Try to get a concrete reason from this PI itself
+  let reason = formatReasonFromPI(piRaw);
+
+  // Resolve invoice id from widened PI
+  const invoiceId: string | null =
+    typeof pi.invoice === "string" ? pi.invoice : pi.invoice?.id ?? null;
+
+  if (!invoiceId) {
+    log(`[${EDGE_FUNCTION_NAME}] payment_intent.payment_failed with no invoice on PI ${piRaw.id}`);
+    break;
+  }
+
+  // Retrieve invoice (expand subscription) to get the Stripe sub id
+  const inv = (await stripe.invoices.retrieve(invoiceId, {
+    expand: ["subscription"],
+  })) as InvoiceWide;
+
+  const stripeSubId: string | null =
+    typeof inv.subscription === "string" ? inv.subscription : inv.subscription?.id ?? null;
+
+  if (!stripeSubId) {
+    log(
+      `[${EDGE_FUNCTION_NAME}] PI ${piRaw.id} → invoice ${invoiceId} has no subscription, skipping DB write`,
+    );
+    break;
+  }
+
+  // Look up local subscription row + user
+  const { data: localSub, error: findErr } = await supabase
+    .from("subscriptions")
+    .select("id, user_id")
+    .eq("stripe_subscription_id", stripeSubId)
+    .maybeSingle();
+  if (findErr) throw findErr;
+  if (!localSub?.id || !localSub.user_id) {
+    log(`[${EDGE_FUNCTION_NAME}] No local sub for stripe_subscription_id=${stripeSubId}`);
+    break;
+  }
+
+  // If reason still empty, refetch PI with latest_charge expanded
+  if (!reason) {
+    const piFull = await stripe.paymentIntents.retrieve(piRaw.id, {
+      expand: ["latest_charge"],
+    });
+    reason = formatReasonFromPI(piFull) ?? "unknown: from payment_intent";
+  }
+
+  await writeFailureToDb(supabase, localSub.user_id, localSub.id, reason);
+  log(
+    `[${EDGE_FUNCTION_NAME}] payment failed (PI) user=${localSub.user_id} sub=${stripeSubId}. Reason: ${reason}`,
+  );
+  break;
+}
+
+
+
+case "charge.failed": {
+  const chRaw = event.data.object as Stripe.Charge;
+  const ch = chRaw as ChargeWide;
+
+  // Pull invoice id via widened Charge
+  const invoiceId: string | null =
+    typeof ch.invoice === "string" ? ch.invoice : ch.invoice?.id ?? null;
+
+  if (!invoiceId) break;
+
+  const inv = (await stripe.invoices.retrieve(invoiceId, {
+    expand: ["subscription"],
+  })) as InvoiceWide;
+
+  const stripeSubId: string | null =
+    typeof inv.subscription === "string" ? inv.subscription : inv.subscription?.id ?? null;
+  if (!stripeSubId) break;
+
+  const { data: localSub } = await supabase
+    .from("subscriptions")
+    .select("id, user_id")
+    .eq("stripe_subscription_id", stripeSubId)
+    .maybeSingle();
+  if (!localSub?.id || !localSub.user_id) break;
+
+  const parts: string[] = [];
+  if (chRaw.failure_code) parts.push(`failure_code=${chRaw.failure_code}`);
+  if (chRaw.outcome?.reason) parts.push(`outcome_reason=${chRaw.outcome.reason}`);
+  if (chRaw.outcome?.seller_message) parts.push(`seller_message=${chRaw.outcome.seller_message}`);
+  if (chRaw.failure_message) parts.push(`failure_message=${chRaw.failure_message}`);
+  const reason = parts.length ? `charge: ${parts.join(", ")}` : "unknown: from charge";
+
+  await writeFailureToDb(supabase, localSub.user_id, localSub.id, reason);
+  log(
+    `[${EDGE_FUNCTION_NAME}] payment failed (charge) user=${localSub.user_id} sub=${stripeSubId}. Reason: ${reason}`,
+  );
+  break;
+}
+
+
+      
       // -------------- CREDIT TOKENS (ONCE PER INVOICE) -----------
       case "invoice.paid":
       case "invoice.payment_succeeded": {
@@ -486,6 +924,7 @@ async function handleReferralReward(referred_user_id: string) {
             break;
         }
 
+        // FIX: Use InvoiceWithSub to access the subscription property
         const inv = invBase as InvoiceWithSub;
 
         // Best source of truth: invoice.subscription
@@ -572,6 +1011,13 @@ async function handleReferralReward(referred_user_id: string) {
 
         // ---------------- Idempotency for this specific token credit ----------------
         const localSubId = await getLocalSubscriptionId(sub.id);
+
+        if (localSubId) {
+          await supabase
+            .from("subscriptions")
+            .update({ payment_failure_reason: null }) // <-- Clear the reason on success
+            .eq("id", localSubId);
+        }
 
         if (!localSubId) {
             log(`invoice ${inv.id}: local subscription row not found for stripe sub ${sub.id}`);
