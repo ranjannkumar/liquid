@@ -2,8 +2,6 @@
 node_modules/
 
 # Environment variables
-.env
-.env.local
 
 # Build artifacts
 dist/
@@ -15,3 +13,4 @@ build/
 .vscode/
 .idea/
 .temp/
+config.bat

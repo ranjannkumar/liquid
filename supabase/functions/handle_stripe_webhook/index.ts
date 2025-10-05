@@ -675,66 +675,66 @@ async function handleReferralReward(referred_user_id: string) {
 
       // Fix: Credit tokens immediately on upgrade (T5)
       // Check if plan_option changed
-      if (oldSub?.plan_option && oldSub.plan_option !== catalogPlanOption) {
-        const user_id = await resolveUserId(sub);
-        const localSubId = await getLocalSubscriptionId(sub.id);
+      // if (oldSub?.plan_option && oldSub.plan_option !== catalogPlanOption) {
+      //   const user_id = await resolveUserId(sub);
+      //   const localSubId = await getLocalSubscriptionId(sub.id);
         
-        // --- Determine the correct token amount to credit for the upgrade ---
-        const { data: priceData, error: priceError } = await supabase
-          .from("subscription_prices")
-          .select("tokens, monthly_refill_tokens")
-          .eq("price_id", price.id)
-          .maybeSingle();
+      //   // --- Determine the correct token amount to credit for the upgrade ---
+      //   const { data: priceData, error: priceError } = await supabase
+      //     .from("subscription_prices")
+      //     .select("tokens, monthly_refill_tokens")
+      //     .eq("price_id", price.id)
+      //     .maybeSingle();
 
-        if (priceError || !priceData) {
-          log(`Error finding price data for upgrade price ID: ${price.id}`);
-          throw new Error(`Price data not found for upgrade price_id: ${price.id}`);
-        }
+      //   if (priceError || !priceData) {
+      //     log(`Error finding price data for upgrade price ID: ${price.id}`);
+      //     throw new Error(`Price data not found for upgrade price_id: ${price.id}`);
+      //   }
         
-        let tokensToCredit = priceData.tokens;
-        let expiresAtIso = epochToIso((sub as any).current_period_end)!; // Full period end for monthly/full yearly credit
+      //   let tokensToCredit = priceData.tokens;
+      //   let expiresAtIso = epochToIso((sub as any).current_period_end)!; // Full period end for monthly/full yearly credit
 
-        // If the new subscription is yearly, credit only the monthly refill amount.
-        if (cycle === "yearly") {
-            // Use monthly_refill_tokens with a fallback to 1/12 of the total.
-            const monthlyRefillAmount = priceData.monthly_refill_tokens || Math.floor(priceData.tokens / 12);
+      //   // If the new subscription is yearly, credit only the monthly refill amount.
+      //   if (cycle === "yearly") {
+      //       // Use monthly_refill_tokens with a fallback to 1/12 of the total.
+      //       const monthlyRefillAmount = priceData.monthly_refill_tokens || Math.floor(priceData.tokens / 12);
             
-            // The credit is the monthly portion, so it expires one month from now.
-            const now = new Date();
-            const expiresMonthly = addExpiry(now, "monthly");
+      //       // The credit is the monthly portion, so it expires one month from now.
+      //       const now = new Date();
+      //       const expiresMonthly = addExpiry(now, "monthly");
             
-            tokensToCredit = monthlyRefillAmount;
-            expiresAtIso = expiresMonthly.toISOString();
+      //       tokensToCredit = monthlyRefillAmount;
+      //       expiresAtIso = expiresMonthly.toISOString();
             
-            // Also, immediately update last_monthly_refill for the subscription.
-            await supabase.from("subscriptions").update({ last_monthly_refill: new Date().toISOString() }).eq("stripe_subscription_id", sub.id);
-        }
+      //       // Also, immediately update last_monthly_refill for the subscription.
+      //       await supabase.from("subscriptions").update({ last_monthly_refill: new Date().toISOString() }).eq("stripe_subscription_id", sub.id);
+      //   }
         
-        // Now, proceed with inserting the token batch using the determined amount and expiry.
-        if (user_id && localSubId && tokensToCredit > 0) {
-          const { data: newBatch, error: batchError } = await supabase.from("user_token_batches").insert({
-            user_id,
-            source: "subscription",
-            subscription_id: localSubId,
-            amount: tokensToCredit,
-            consumed: 0,
-            is_active: true,
-            // FIX: Use the calculated expiresAtIso. This resolves the NOT NULL constraint error.
-            expires_at: expiresAtIso, 
-            note: `plan-upgrade-from-${oldSub.plan_option}-to-${catalogPlanOption}`
-          }).select("id").single();
-          if (batchError) throw batchError;
-          await supabase.from("token_event_logs").insert({
-            user_id,
-            batch_id: newBatch.id,
-            delta: tokensToCredit,
-            reason: "subscription_upgrade_credit",
-          });
-          log(`subscription upgraded and ${tokensToCredit} tokens credited for sub=${sub.id}`);
-        } else {
-            log(`Upgrade token credit skipped for sub=${sub.id}: user_id or localSubId missing, or tokensToCredit is zero.`);
-        }
-      }
+      //   // Now, proceed with inserting the token batch using the determined amount and expiry.
+      //   if (user_id && localSubId && tokensToCredit > 0) {
+      //     const { data: newBatch, error: batchError } = await supabase.from("user_token_batches").insert({
+      //       user_id,
+      //       source: "subscription",
+      //       subscription_id: localSubId,
+      //       amount: tokensToCredit,
+      //       consumed: 0,
+      //       is_active: true,
+      //       // FIX: Use the calculated expiresAtIso. This resolves the NOT NULL constraint error.
+      //       expires_at: expiresAtIso, 
+      //       note: `plan-upgrade-from-${oldSub.plan_option}-to-${catalogPlanOption}`
+      //     }).select("id").single();
+      //     if (batchError) throw batchError;
+      //     await supabase.from("token_event_logs").insert({
+      //       user_id,
+      //       batch_id: newBatch.id,
+      //       delta: tokensToCredit,
+      //       reason: "subscription_upgrade_credit",
+      //     });
+      //     log(`subscription upgraded and ${tokensToCredit} tokens credited for sub=${sub.id}`);
+      //   } else {
+      //       log(`Upgrade token credit skipped for sub=${sub.id}: user_id or localSubId missing, or tokensToCredit is zero.`);
+      //   }
+      // }
         log(`subscription updated sub=${sub.id}`);
         break;
       }
