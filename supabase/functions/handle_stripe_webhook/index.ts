@@ -636,6 +636,7 @@ async function handleReferralReward(referred_user_id: string) {
       }
 
       // ---------------- SUBSCRIPTION UPDATED ---------------------
+ // ---------------- SUBSCRIPTION UPDATED ---------------------
       case "customer.subscription.updated": {
         const sub = event.data.object as Stripe.Subscription;
         const price = sub.items.data[0].price as Stripe.Price;
@@ -738,6 +739,8 @@ async function handleReferralReward(referred_user_id: string) {
         break;
       }
 
+
+
       // ---------------- SUBSCRIPTION DELETED ---------------------
       case "customer.subscription.deleted": {
         const sub = event.data.object as Stripe.Subscription;
@@ -767,7 +770,6 @@ case "invoice.payment_failed": {
   const invBase = event.data.object as Stripe.Invoice;
   const inv = invBase as InvoiceWithSub;
 
-  // --- Resolve the related Stripe Subscription ID (unchanged logic + small hardening) ---
   let stripeSubId: string | null =
     typeof inv.subscription === "string" ? inv.subscription : null;
 
@@ -780,12 +782,12 @@ case "invoice.payment_failed": {
     try {
       const subs = await stripe.subscriptions.list({
         customer: inv.customer,
-        status: "all", // include past_due/unpaid/canceled to not miss it
+        status: "all",
         limit: 1,
       });
       stripeSubId = subs.data[0]?.id ?? null;
-    } catch (_e) {
-      // ignore; we'll bail out below if still null
+    } catch {
+      // ignore
     }
   }
 
@@ -794,10 +796,8 @@ case "invoice.payment_failed": {
     break;
   }
 
-  // --- Extract a robust failure reason (NEW) ---
   const failureReason = await extractFailureReasonFromInvoice(stripe, invBase);
 
-  // --- Find local subscription row ---
   const { data: localSub, error: findErr } = await supabase
     .from("subscriptions")
     .select("id, user_id")
@@ -811,27 +811,30 @@ case "invoice.payment_failed": {
     break;
   }
 
-  // --- Update local subscription flags + failure reason ---
+  // ✅ Keep sub active during dunning; only record the failure reason
   const { error: subUpdateError } = await supabase
     .from("subscriptions")
     .update({
-      is_active: false,
-      payment_failure_reason: failureReason, // <-- key write
+      // is_active: false,          // ❌ remove this
+      payment_failure_reason: failureReason, // ✅ keep this
+      // Optionally store the next retry attempt if you added a column:
+      // next_retry_at: inv.next_payment_attempt ? new Date(inv.next_payment_attempt * 1000).toISOString() : null
     })
     .eq("id", localSub.id);
   if (subUpdateError) throw subUpdateError;
 
-  // --- Mark user flags so you can trigger emails elsewhere (unchanged) ---
+  // ✅ Flag the user for comms; don't revoke access here
   await supabase
     .from("users")
-    .update({ has_active_subscription: false, has_payment_issue: true })
+    .update({
+      // has_active_subscription: false, // ❌ remove this
+      has_payment_issue: true           // ✅ keep this
+    })
     .eq("user_id", user_id);
 
-  log(
-    `payment failed for user=${user_id} sub=${stripeSubId}. Reason: ${failureReason}`
-  );
+  log(`payment failed for user=${user_id} sub=${stripeSubId}. Reason: ${failureReason}`);
 
-  // If you want to enqueue an email, uncomment and point to your queue/table:
+  // Optional: enqueue email/notification
   // await supabase.from("email_queue").insert({
   //   user_id,
   //   template: "payment_failed",
@@ -840,6 +843,7 @@ case "invoice.payment_failed": {
 
   break;
 }
+
 
 case "payment_intent.payment_failed": {
   const piRaw = event.data.object as Stripe.PaymentIntent;
@@ -943,197 +947,211 @@ case "charge.failed": {
 
       
       // -------------- CREDIT TOKENS (ONCE PER INVOICE) -----------
-      case "invoice.paid":
-      case "invoice.payment_succeeded": {
-        const invBase = event.data.object as Stripe.Invoice;
-        if (invBase.status !== "paid") {
-          log(`skip invoice ${invBase.id}: status=${invBase.status}`);
-          break;
-        }
+  case "invoice.paid":
+case "invoice.payment_succeeded": {
+  const invBase = event.data.object as Stripe.Invoice;
+  if (invBase.status !== "paid") {
+    log(`skip invoice ${invBase.id}: status=${invBase.status}`);
+    break;
+  }
 
-        // Fix: Skip token credit for upgrades handled by customer.subscription.updated (T5)
-        if (invBase.billing_reason === 'subscription_cycle') {
-          // This is a renewal, which should be handled here.
-        } else if (invBase.billing_reason === 'subscription_create') {
-          // This is an initial subscription. Proceed with the credit.
-        } else if (invBase.billing_reason === 'subscription_update') {
-          log(`skip invoice ${invBase.id}: upgrade already handled by subscription.updated`);
-          break;
-        } else {
-            log(`invoice ${invBase.id} has unknown billing reason: ${invBase.billing_reason}, ignoring.`);
-            break;
-        }
+  // We handle three billing reasons here:
+  // - subscription_create  → first invoice of a new sub (we will credit)
+  // - subscription_update  → mid-cycle change (upgrade) (we will credit)
+  // - subscription_cycle   → renewal invoice (we SKIP for yearly; cron handles monthly refills)
+  const br = invBase.billing_reason;
+  const isInitialCreation = br === "subscription_create";
+  const isUpgradeInvoice  = br === "subscription_update";
+  const isRenewal         = br === "subscription_cycle";
 
-        // FIX: Use InvoiceWithSub to access the subscription property
-        const inv = invBase as InvoiceWithSub;
+  // FIX: We DO handle upgrades here (no longer skipping to subscription.updated)
+  if (!(isInitialCreation || isUpgradeInvoice || isRenewal)) {
+    log(`invoice ${invBase.id} has unhandled billing reason: ${br}, ignoring.`);
+    break;
+  }
 
-        // Best source of truth: invoice.subscription
-        let stripeSubId: string | null =
-          typeof inv.subscription === "string" ? inv.subscription : null;
+  // Cast for easier access to subscription field if present
+  const inv = invBase as InvoiceWithSub;
 
-        // Fallback: inspect invoice lines
-        if (!stripeSubId) {
-          const lineWithSub = inv.lines?.data?.find(
-            (l) => typeof (l as any).subscription === "string",
-          );
-          stripeSubId = (lineWithSub?.subscription as string) ?? null;
-        }
+  // Resolve the Stripe subscription id (several fallbacks)
+  let stripeSubId: string | null =
+    typeof inv.subscription === "string" ? inv.subscription : null;
 
-        // Fallback: customer's active subscription
-        if (!stripeSubId && typeof inv.customer === "string") {
-          const subs = await stripe.subscriptions.list({
-            customer: inv.customer,
-            status: "active",
-            limit: 1,
-          });
-          stripeSubId = subs.data[0]?.id ?? null;
-        }
+  if (!stripeSubId) {
+    const lineWithSub = inv.lines?.data?.find(
+      (l) => typeof (l as any).subscription === "string",
+    );
+    stripeSubId = (lineWithSub?.subscription as string) ?? null;
+  }
 
-        if (!stripeSubId) {
-          log(`invoice ${inv.id} has no subscription, ignoring`);
-          break;
-        }
+  if (!stripeSubId && typeof inv.customer === "string") {
+    const subs = await stripe.subscriptions.list({
+      customer: inv.customer,
+      status: "active",
+      limit: 1,
+    });
+    stripeSubId = subs.data[0]?.id ?? null;
+  }
 
-        const sub = await stripe.subscriptions.retrieve(stripeSubId);
-        const user_id = await resolveUserId(sub, invBase);
-        if (!user_id) {
-          const msg = `could not resolve user_id for subscription ${stripeSubId}`;
-          log(msg);
-          await notifyTelegram(`[${EDGE_FUNCTION_NAME}] ${msg}`);
-          break;
-        }
+  if (!stripeSubId) {
+    log(`invoice ${inv.id} has no subscription, ignoring`);
+    break;
+  }
 
-        const price = sub.items.data[0].price as Stripe.Price;
-        const cycle: DbCycle = dbCycleFromStripe(price.recurring?.interval ?? "month");
-        
-        // FIX: Credit correct token amount based on billing reason and cycle
-        const { data: priceData, error: priceError } = await supabase
-          .from("subscription_prices")
-          .select("tokens, monthly_refill_tokens")
-          .eq("price_id", price.id)
-          .maybeSingle();
+  // Fetch the Stripe subscription and resolve user
+  const sub = await stripe.subscriptions.retrieve(stripeSubId, { expand: ["items.data.price"] });
+  const user_id = await resolveUserId(sub, invBase);
+  if (!user_id) {
+    const msg = `could not resolve user_id for subscription ${stripeSubId}`;
+    log(msg);
+    await notifyTelegram(`[${EDGE_FUNCTION_NAME}] ${msg}`);
+    break;
+  }
 
-        if (priceError || !priceData) {
-          log(`Error finding price data for price ID: ${price.id}`);
-          throw new Error(`Price data not found for price_id: ${price.id}`);
-        }
-        
-        let tokensToCredit = 0;
-        const isInitialCreation = inv.billing_reason === "subscription_create";
-        const isRenewal = inv.billing_reason === "subscription_cycle"; 
+  // Price & cycle
+  const price = sub.items.data[0].price as Stripe.Price;
+  const cycle: DbCycle = dbCycleFromStripe(price.recurring?.interval ?? "month");
 
-        if (isInitialCreation) {
-            // FIX: Credit only the first monthly amount for a new yearly subscription
-            if (cycle === "yearly" && priceData.monthly_refill_tokens) {
-                tokensToCredit = priceData.monthly_refill_tokens;
-                // await supabase.from("subscriptions").update({ last_monthly_refill: new Date().toISOString() }).eq("stripe_subscription_id", sub.id);
-            } else {
-                tokensToCredit = priceData.tokens;
-            }
-        } else if (isRenewal) {
-            // FIX 2: Handle renewals based on cycle type.
-            if (cycle === "yearly" && priceData.monthly_refill_tokens) {
-                // A yearly plan renewal should *not* credit tokens here, as monthly refills are handled by the CRON job.
-                // It has already been paid for the year, so we break to avoid crediting the FULL amount.
-                log(`skip invoice ${invBase.id}: yearly renewal payment handled, tokens are credited monthly by CRON.`);
-                break;
-            } else {
-                tokensToCredit = priceData.tokens; // Monthly/Daily renewals get full tokens
-            }
-        } else {
-            // Catch-all for other reasons if needed, but the primary logic is above.
-            tokensToCredit = priceData.tokens;
-        }
-        
-        // ---------------- Period-end based expiry (production-correct) ----------------
-        // Prefer the invoice line's period end (accurate for this credit).
-        const recurringLine =
-          inv.lines?.data?.find((l) => (l as any).price?.type === "recurring" || l.subscription) ??
-          inv.lines?.data?.[0];
-        const linePeriodEndSec: number | undefined = (recurringLine as any)?.period?.end;
+  // Look up token amounts for this price_id from your table
+  const { data: priceData, error: priceError } = await supabase
+    .from("subscription_prices")
+    .select("tokens, monthly_refill_tokens")
+    .eq("price_id", price.id)
+    .maybeSingle();
 
-        // Fallback to subscription's current period end (seconds since epoch)
-        const subPeriodEndSec: number | undefined = (sub as any)?.current_period_end;
+  if (priceError || !priceData) {
+    log(`Error finding price data for price ID: ${price.id}`);
+    throw new Error(`Price data not found for price_id: ${price.id}`);
+  }
 
-        // Final fallback: compute now + cycle
-        let expiresAtIso =
-          epochToIso(linePeriodEndSec ?? subPeriodEndSec) ??
-          addExpiry(new Date(), cycle).toISOString();
+  // ---------------- Decide how many tokens to credit ----------------
+  // Policy:
+  // - YEARLY:
+  //     • subscription_create  → credit ONLY first monthly batch (monthly_refill_tokens)
+  //     • subscription_update  → (upgrade to yearly) credit ONLY first monthly batch
+  //     • subscription_cycle   → SKIP (monthly refills via CRON)
+  // - NON-YEARLY (monthly/daily):
+  //     • subscription_create / subscription_update / subscription_cycle → credit full tokens
+  let tokensToCredit = 0;
 
-          if (isInitialCreation && cycle === "yearly") {
-            const now = new Date();
-            const expiresMonthly = addExpiry(now, "monthly");
-            expiresAtIso = expiresMonthly.toISOString();
-            
-            // This is the correct place to set last_monthly_refill for initial credit
-            await supabase.from("subscriptions").update({ last_monthly_refill: now.toISOString() }).eq("stripe_subscription_id", sub.id);
-        }
+  if (cycle === "yearly") {
+    if (isRenewal) {
+      log(`skip invoice ${invBase.id}: yearly renewal paid; monthly refills are handled by CRON.`);
+      break;
+    }
+    // creation or upgrade: grant ONE monthly batch now
+    tokensToCredit = priceData.monthly_refill_tokens ?? 0;
+  } else {
+    // monthly/daily/etc. → your existing behavior: credit full tokens
+    tokensToCredit = priceData.tokens;
+  }
 
-        // ---------------- Idempotency for this specific token credit ----------------
-        const localSubId = await getLocalSubscriptionId(sub.id);
+  // If nothing to credit (e.g., yearly but monthly_refill_tokens not configured), stop safely
+  if (!tokensToCredit || tokensToCredit <= 0) {
+    log(`invoice ${invBase.id}: tokensToCredit=0 for price ${price.id}, skipping.`);
+    break;
+  }
 
-        if (localSubId) {
-          await supabase
-            .from("subscriptions")
-            .update({ payment_failure_reason: null }) // <-- Clear the reason on success
-            .eq("id", localSubId);
-        }
+  // ---------------- Compute expiry ----------------
+  // Prefer invoice line's period end → then subscription → then now+cycle
+  const recurringLine =
+    inv.lines?.data?.find((l) => (l as any).price?.type === "recurring" || l.subscription) ??
+    inv.lines?.data?.[0];
+  const linePeriodEndSec: number | undefined = (recurringLine as any)?.period?.end;
+  const subPeriodEndSec: number | undefined = (sub as any)?.current_period_end;
 
-        if (!localSubId) {
-            log(`invoice ${inv.id}: local subscription row not found for stripe sub ${sub.id}`);
-            break;
-        }
-        
-        // BUG FIX: Use the new invoice_id column for robust idempotency on renewals (T4)
-        const { data: existingBatch, error: existingBatchError } = await supabase
-            .from("user_token_batches")
-            .select("id")
-            .eq("invoice_id", inv.id)
-            .maybeSingle();
+  let expiresAtIso =
+    epochToIso(linePeriodEndSec ?? subPeriodEndSec) ??
+    addExpiry(new Date(), cycle).toISOString();
 
-        if (existingBatchError) {
-            log(`Error checking for existing batch for invoice ${inv.id}: ${stringifyErr(existingBatchError)}`);
-            throw existingBatchError;
-        }
-        if (existingBatch) {
-            log(`Invoice ${inv.id} already processed for token credit. Skipping.`);
-            break;
-        }
+  // For the FIRST monthly grant of a YEARLY plan (creation or upgrade),
+  // set expiry to 1 month from now (not the whole year),
+  // and stamp last_monthly_refill
+  if (cycle === "yearly" && (isInitialCreation || isUpgradeInvoice)) {
+    const now = new Date();
+    expiresAtIso = addExpiry(now, "monthly").toISOString();
+    await supabase
+      .from("subscriptions")
+      .update({ last_monthly_refill: now.toISOString() })
+      .eq("stripe_subscription_id", sub.id);
+  }
 
-        const { data: newBatch, error: batchError } = await supabase.from("user_token_batches").insert({
-          user_id,
-          source: "subscription",
-          subscription_id: localSubId,
-          invoice_id: inv.id, // BUG FIX: Add the invoice ID here
-          amount: tokensToCredit,
-          consumed: 0,
-          is_active: true,
-          expires_at: expiresAtIso,
-          note: `Subscription: ${sub.id}`
-        }).select("id").single();
-        
-        if (batchError) throw batchError;
+  // ---------------- Idempotency on invoice_id ----------------
+  const localSubId = await getLocalSubscriptionId(sub.id);
 
-        await supabase.from("token_event_logs").insert({
-          user_id,
-          batch_id: newBatch.id,
-          delta: tokensToCredit,
-          reason: inv.billing_reason === "subscription_create" ? "subscription_initial_credit" : "subscription_refill",
-        });
+  if (localSubId) {
+    await supabase
+      .from("subscriptions")
+      .update({ payment_failure_reason: null })
+      .eq("id", localSubId);
+  } else {
+    log(`invoice ${inv.id}: local subscription row not found for stripe sub ${sub.id}`);
+    break;
+  }
 
-        await supabase
-          .from("users")
-          .update({ has_active_subscription: true, has_payment_issue: false })
-          .eq("user_id", user_id);
+  // If a batch already exists for this invoice, do nothing
+  const { data: existingBatch, error: existingBatchError } = await supabase
+    .from("user_token_batches")
+    .select("id")
+    .eq("invoice_id", inv.id)
+    .maybeSingle();
 
-        if (isInitialCreation) {
-          await handleReferralReward(user_id);
-        }
+  if (existingBatchError) {
+    log(`Error checking for existing batch for invoice ${inv.id}: ${stringifyErr(existingBatchError)}`);
+    throw existingBatchError;
+  }
+  if (existingBatch) {
+    log(`Invoice ${inv.id} already processed for token credit. Skipping.`);
+    break;
+  }
 
-        const invoiceId = inv.id ?? `unknown-invoice-${event.id}`;
-        log(`credited ${tokensToCredit} tokens to user=${user_id} from invoice=${invoiceId}`);
-        break;
-      }
+  // ---------------- Insert the credit ----------------
+  const { data: newBatch, error: batchError } = await supabase
+    .from("user_token_batches")
+    .insert({
+      user_id,
+      source: "subscription",
+      subscription_id: localSubId,
+      invoice_id: inv.id, // idempotency anchor
+      amount: tokensToCredit,
+      consumed: 0,
+      is_active: true,
+      expires_at: expiresAtIso,
+      note:
+        cycle === "yearly" && (isInitialCreation || isUpgradeInvoice)
+          ? `invoice:${inv.id} | first-month-yearly`
+          : `Subscription: ${sub.id}`,
+    })
+    .select("id")
+    .single();
+
+  if (batchError) throw batchError;
+
+  await supabase.from("token_event_logs").insert({
+    user_id,
+    batch_id: newBatch.id,
+    delta: tokensToCredit,
+    reason: isInitialCreation
+      ? "subscription_initial_credit"
+      : isUpgradeInvoice
+      ? "subscription_upgrade_credit"
+      : "subscription_refill",
+  });
+
+  await supabase
+    .from("users")
+    .update({ has_active_subscription: true, has_payment_issue: false })
+    .eq("user_id", user_id);
+
+  if (isInitialCreation) {
+    await handleReferralReward(user_id);
+  }
+
+  const invoiceId = inv.id ?? `unknown-invoice-${event.id}`;
+  log(`credited ${tokensToCredit} tokens to user=${user_id} from invoice=${invoiceId}`);
+  break;
+}
+
 
       // -------------- PAYMENT INTENT SUCCEEDED -----------
       case "payment_intent.succeeded": {
