@@ -2,8 +2,6 @@
 node_modules/
 
 # Environment variables
-.env
-.env.local
 
 # Build artifacts
 dist/
@@ -12,6 +10,6 @@ build/
 
 # OS and IDE files
 .DS_Store
-.vscode/
 .idea/
 .temp/
+config.bat
